@@ -3,16 +3,15 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>EEG Data</title>
+    <title>EEG Data Analysis</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="static/js/app.js"></script>
-    <link rel="stylesheet" href="static/styles.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
     <div class="container">
-        <h1>EEG Data</h1>
+        <h1>EEG Data Analysis</h1>
         <canvas id="eegChart"></canvas>
         <div class="controls">
             <button id="startBtn" onclick="startAnalysis()">Start Analysis</button>
@@ -54,6 +53,7 @@
             <div class="color-box" data-label="Ch8" style="background-color: white;"></div>
         </div>
     </div>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>
 
