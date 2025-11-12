@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>EEG Data</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="/static/js/app.js" defer></script>
+</head>
+<body>
+  <div class="container">
+    <h1>EEG Data</h1>
+    <div class="controls">
+      <button id="startBtn" onclick="startAnalysis()">Start Analysis</button>
+      <button id="stopBtn" onclick="stopAnalysis()" disabled>Stop Analysis</button>
+    </div>
+    <canvas id="eegChart"></canvas>
+    <div id="status"></div>
+  </div>
+</body>
+</html>
