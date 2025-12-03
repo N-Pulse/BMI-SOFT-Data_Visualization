@@ -3,16 +3,46 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>EEG Data</title>
+    <title>EEG Data Analysis</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="static/js/app.js"></script>
-    <link rel="stylesheet" href="static/styles.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
-<body>
+<body data-signal-type="{{ signal_type }}">
     <div class="container">
-        <h1>EEG Data</h1>
+        <h1>EEG Data Analysis</h1>
+        <div class="section signal-type-section">
+            <h2>Signal Type</h2>
+            <div class="signal-toggle">
+                <button id="signalEegBtn" class="signal-btn" onclick="setSignalType('eeg')">EEG</button>
+                <button id="signalEmgBtn" class="signal-btn" onclick="setSignalType('emg')">EMG</button>
+            </div>
+            <p id="signalDescription" class="signal-description">
+                Monitor electrical brain activity (EEG mode).
+            </p>
+        </div>
+        <!-- Fixed typo in class name from simulation-sectixon to simulation-section -->
+        <div class="section simulation-section">
+            <h2>Mode Selection</h2>
+            <div class="mode-toggle">
+                <label class="switch">
+                    <input type="checkbox" id="simulationToggle" onchange="toggleSimulation()">
+                    <span class="slider"></span>
+                </label>
+                <span id="modeLabel" class="mode-label">Hardware Mode</span>
+                <span class="mode-description">Toggle to enable simulation mode for testing without hardware</span>
+            </div>
+            
+            <!-- File upload for simulation mode -->
+            <div id="fileUploadSection" style="display: none; margin-top: 20px;">
+                <h3>Upload EEG Data File</h3>
+                <p class="file-description">Upload a JSON file containing EEG data to replay in simulation mode</p>
+                <input type="file" id="eegFileInput" accept=".json" onchange="uploadEEGFile()">
+                <div id="fileStatus" class="file-status"></div>
+            </div>
+        </div>
+        
         <canvas id="eegChart"></canvas>
         <div class="controls">
             <button id="startBtn" onclick="startAnalysis()">Start Analysis</button>
@@ -54,6 +84,10 @@
             <div class="color-box" data-label="Ch8" style="background-color: white;"></div>
         </div>
     </div>
+    <script>
+        window.initialSignalType = "{{ signal_type }}";
+    </script>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>
 
