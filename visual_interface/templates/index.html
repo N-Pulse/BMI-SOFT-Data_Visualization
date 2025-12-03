@@ -1,4 +1,3 @@
-<!-- v0.1a-->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -8,86 +7,292 @@
     <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <style>
+        /* Lightweight layout tweaks to make UI more horizontal and modal styling */
+        .horizontal-blocks {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 16px;
+            align-items: start;
+        }
+        .metadata-modal.hidden { display: none; }
+        .metadata-modal {
+            position: fixed;
+            inset: 0;
+            z-index: 1000;
+        }
+        .metadata-backdrop {
+            position: absolute;
+            inset: 0;
+            background: rgba(0,0,0,0.45);
+        }
+        .metadata-dialog {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: #fff;
+            width: min(900px, 90vw);
+            max-height: 90vh;
+            overflow: hidden;
+            border-radius: 12px;
+            box-shadow: 0 12px 40px rgba(0,0,0,0.25);
+            display: flex;
+            flex-direction: column;
+        }
+        .metadata-dialog header,
+        .metadata-dialog footer {
+            padding: 12px 16px;
+            border-bottom: 1px solid #eee;
+        }
+        .metadata-dialog footer { border-top: 1px solid #eee; border-bottom: none; }
+        .metadata-dialog .body {
+            padding: 12px 16px;
+            overflow-y: auto;
+        }
+        .metadata-actions {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .metadata-table .metadata-row {
+            display: grid;
+            grid-template-columns: 32px 52px 1fr 1fr 80px;
+            gap: 8px;
+            align-items: center;
+            padding: 6px 0;
+            border-bottom: 1px solid #f0f0f0;
+            transition: background 0.15s ease, border 0.15s ease;
+        }
+        .metadata-table .metadata-row.alt {
+            background: #f7f7f7;
+        }
+        .metadata-table input[type="text"] { width: 100%; }
+        .metadata-empty { padding: 8px; color: #666; }
+        .metadata-status { margin-top: 6px; font-size: 0.9rem; }
+        .metadata-close { border: none; background: transparent; font-size: 1.2rem; cursor: pointer; }
+        .meta-handle {
+            cursor: grab;
+            user-select: none;
+            color: #444;
+            font-size: 1.2rem;
+            text-align: center;
+            font-weight: 600;
+        }
+        .metadata-row.dragging {
+            background: #f5f5f5;
+            border-radius: 6px;
+            opacity: 0.9;
+        }
+        .metadata-row.drag-target {
+            border: 1px dashed #888;
+            background: #eef2f7;
+        }
+    </style>
 </head>
 <body data-signal-type="{{ signal_type }}">
     <div class="container">
-        <h1>EEG Data Analysis</h1>
-        <div class="section signal-type-section">
-            <h2>Signal Type</h2>
-            <div class="signal-toggle">
-                <button id="signalEegBtn" class="signal-btn" onclick="setSignalType('eeg')">EEG</button>
-                <button id="signalEmgBtn" class="signal-btn" onclick="setSignalType('emg')">EMG</button>
+        <h1>Real-time Signal Recording</h1>
+        <div class="grid two-col">
+            <div>
+                <div class="section signal-type-section">
+                    <h2>Signal Type</h2>
+                    <div class="signal-toggle">
+                        <button id="signalEegBtn" class="signal-btn" onclick="setSignalType('eeg')">EEG</button>
+                        <button id="signalEmgBtn" class="signal-btn" onclick="setSignalType('emg')">EMG</button>
+                        <button id="signalMotionBtn" class="signal-btn" onclick="setSignalType('motion')">Motion</button>
+                    </div>
+                    <p id="signalDescription" class="signal-description">
+                        Monitor electrical brain activity (EEG mode).
+                    </p>
+                </div>
+                <div class="section simulation-section">
+                    <h2>Mode Selection</h2>
+                    <div class="mode-toggle">
+                        <label class="switch">
+                            <input type="checkbox" id="simulationToggle" onchange="toggleSimulation()">
+                            <span class="slider"></span>
+                        </label>
+                        <span id="modeLabel" class="mode-label">Hardware Mode</span>
+                        <span class="mode-description">Toggle to enable simulation mode for testing without hardware</span>
+                    </div>
+                    <div id="fileUploadSection" style="display: none; margin-top: 20px;">
+                        <h3>Upload EEG/EMG Data File</h3>
+                        <p class="file-description">Upload a JSON file containing EEG or EMG data to replay in simulation mode</p>
+                        <input type="file" id="eegFileInput" accept=".json" onchange="uploadEEGFile()">
+                        <div id="fileStatus" class="file-status"></div>
+                    </div>
+                </div>
             </div>
-            <p id="signalDescription" class="signal-description">
-                Monitor electrical brain activity (EEG mode).
-            </p>
-        </div>
-        <!-- Fixed typo in class name from simulation-sectixon to simulation-section -->
-        <div class="section simulation-section">
-            <h2>Mode Selection</h2>
-            <div class="mode-toggle">
-                <label class="switch">
-                    <input type="checkbox" id="simulationToggle" onchange="toggleSimulation()">
-                    <span class="slider"></span>
-                </label>
-                <span id="modeLabel" class="mode-label">Hardware Mode</span>
-                <span class="mode-description">Toggle to enable simulation mode for testing without hardware</span>
+            <div>
+                <div class="section processing-section">
+                    <h2>Signal Processing</h2>
+                    <div class="processing-grid">
+                        <label>Sampling Rate (Hz)
+                            <input type="number" id="sampling_rate" min="50" max="2000" step="10" value="250" oninput="updateSettings()">
+                        </label>
+                        <label>Downsample Factor
+                            <input type="number" id="downsample_factor" min="1" max="10" value="1" oninput="updateSettings()">
+                        </label>
+                        <label>Lowcut (Hz)
+                            <input type="number" id="lowcut" min="0.1" max="100" step="0.5" value="3" oninput="updateSettings()">
+                        </label>
+                        <label>Highcut (Hz)
+                            <input type="number" id="highcut" min="1" max="200" step="0.5" value="45" oninput="updateSettings()">
+                        </label>
+                        <label>Filter Order
+                            <input type="number" id="order" min="1" max="6" step="1" value="2" oninput="updateSettings()">
+                        </label>
+                    </div>
+                    <div class="toggle-row">
+                        <label><input type="checkbox" id="baseline_correction_enabled" checked onchange="updateSettings()"> Baseline Correction</label>
+                        <label><input type="checkbox" id="bandpass_filter_enabled" onchange="updateSettings()"> Bandpass Filter</label>
+                        <label><input type="checkbox" id="smoothing_enabled" onchange="updateSettings()"> Smoothing</label>
+                    </div>
+                </div>
+                <div class="section">
+                    <h2>Channel Settings</h2>
+                    <div class="channel-settings">
+                        <label>Enabled Channels
+                            <input type="number" id="enabled_channels" min="1" max="8" value="8" oninput="updateSettings()">
+                        </label>
+                        <label><input type="checkbox" id="ref_enabled" checked onchange="updateSettings()"> REF Enabled</label>
+                        <label><input type="checkbox" id="biasout_enabled" checked onchange="updateSettings()"> BIASOUT Enabled</label>
+                    </div>
+                    <div class="channel-selector">
+                        <div class="channel-group">
+                            <h4>Channels</h4>
+                            <div id="channelList" class="channel-pills"></div>
+                        </div>
+                        <div class="channel-legend">
+                            <div class="color-box" style="background-color: yellow;"></div> Ch1
+                            <div class="color-box" style="background-color: orange;"></div> Ch2
+                            <div class="color-box" style="background-color: brown;"></div> Ch3
+                            <div class="color-box" style="background-color: green;"></div> Ch4
+                            <div class="color-box" style="background-color: purple;"></div> Ch5
+                            <div class="color-box" style="background-color: blue;"></div> Ch6
+                            <div class="color-box" style="background-color: grey;"></div> Ch7
+                            <div class="color-box" style="background-color: white;"></div> Ch8
+                        </div>
+                    </div>
+                </div>
             </div>
-            
-            <!-- File upload for simulation mode -->
-            <div id="fileUploadSection" style="display: none; margin-top: 20px;">
-                <h3>Upload EEG Data File</h3>
-                <p class="file-description">Upload a JSON file containing EEG data to replay in simulation mode</p>
-                <input type="file" id="eegFileInput" accept=".json" onchange="uploadEEGFile()">
-                <div id="fileStatus" class="file-status"></div>
+        </div>
+
+        <div class="section big-visual">
+            <div class="section-header">
+                <h2>Real-time Waveform</h2>
+                <div class="waveform-mode">
+                    <label for="waveformModeSelect">Display</label>
+                    <select id="waveformModeSelect" onchange="setChartMode(this.value)">
+                        <option value="overlap" selected>Overlap</option>
+                        <option value="stacked">EEG stacked</option>
+                    </select>
+                </div>
+                <div id="qualityOverlay" class="quality-overlay">Quality Alert: Signal quality low</div>
+            </div>
+            <canvas id="eegChart"></canvas>
+            <div class="controls">
+                <button id="startBtn" onclick="startAnalysis()">Start Stream</button>
+                <button id="stopBtn" onclick="stopAnalysis()" disabled>Stop Stream</button>
+                <button id="calibrateBtn" onclick="startCalibration()">Calibrate</button>
+                <button id="exportBtn" onclick="exportData()">Export Buffer</button>
             </div>
         </div>
-        
-        <canvas id="eegChart"></canvas>
-        <div class="controls">
-            <button id="startBtn" onclick="startAnalysis()">Start Analysis</button>
-            <button id="stopBtn" onclick="stopAnalysis()" disabled>Stop Analysis</button>
-            <button id="calibrateBtn" onclick="startCalibration()">Start Calibration</button>
-            <button id="exportBtn" onclick="exportData()">Export Data</button>
+
+        <div class="grid horizontal-blocks">
+            <div class="section">
+                <h2>Recording Controls</h2>
+                <div class="recording-grid">
+                    <label class="short-field">Subject
+                        <input type="text" id="recSubject" value="01">
+                    </label>
+                    <label class="short-field">Session
+                        <input type="text" id="recSession" value="01">
+                    </label>
+                    <label>Task
+                        <input type="text" id="recTask" value="resting">
+                    </label>
+                    <label>Run
+                        <input type="text" id="recRun" value="01">
+                    </label>
+                    <label>Modality
+                        <select id="recModality">
+                            <option value="eeg">EEG</option>
+                            <option value="emg">EMG</option>
+                            <option value="motion">Motion</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="controls">
+                    <button id="startRecBtn" onclick="startRecording()">Start Recording</button>
+                    <button id="pauseRecBtn" onclick="pauseRecording()" disabled>Pause</button>
+                    <button id="stopRecBtn" onclick="stopRecording()" disabled>Stop & Save</button>
+                    <button onclick="openMetadataModal()">Edit Metadata</button>
+                </div>
+                <div class="event-row">
+                    <input type="text" id="markerLabel" placeholder="Marker label (e.g., blink)">
+                    <input type="text" id="markerDescription" placeholder="Description (optional)">
+                    <button onclick="addMarker()">Add Marker</button>
+                </div>
+                <div id="markerList" class="marker-list"></div>
+            </div>
+            <div class="section">
+                <h2>Live Metrics</h2>
+                <div class="metrics-grid">
+                    <div class="metric-card">
+                        <span class="metric-label">Avg Power</span>
+                        <span id="avgPower" class="metric-value">--</span>
+                    </div>
+                    <div class="metric-card">
+                        <span class="metric-label">Muscle Activation</span>
+                        <span id="activation" class="metric-value">--</span>
+                    </div>
+                    <div class="metric-card">
+                        <span class="metric-label">SNR</span>
+                        <span id="snr" class="metric-value">--</span>
+                    </div>
+                    <div class="metric-card">
+                        <span class="metric-label">Channel Quality</span>
+                        <span id="impedance" class="metric-value">--</span>
+                    </div>
+                </div>
+                <div class="feature-charts">
+                    <canvas id="featureTimeChart"></canvas>
+                    <canvas id="featureBarChart"></canvas>
+                </div>
+            </div>
         </div>
-        <div class="section">
-            <h2>Channel Settings</h2>
-            <label for="enabled_channels">Enabled Channels:</label>
-            <input type="number" id="enabled_channels" name="enabled_channels" min="1" max="8" value="8" oninput="updateSettings()">
-            <span id="enabledChannelsValue">8</span>
-            <br>
-            <label for="ref_enabled">REF Enabled:</label>
-            <input type="checkbox" id="ref_enabled" name="ref_enabled" checked onchange="updateSettings()">
-            <br>
-            <label for="biasout_enabled">BIASOUT Enabled:</label>
-            <input type="checkbox" id="biasout_enabled" name="biasout_enabled" checked onchange="updateSettings()">
-        </div>
-        <div class="section">
-            <h2>Advanced Settings</h2>
-            <label for="baseline_correction_enabled">Baseline Correction:</label>
-            <input type="checkbox" id="baseline_correction_enabled" name="baseline_correction_enabled" checked onchange="updateSettings()">
-            <br>
-            <label for="bandpass_filter_enabled">Bandpass Filter:</label>
-            <input type="checkbox" id="bandpass_filter_enabled" name="bandpass_filter_enabled" onchange="updateSettings()">
-        </div>
-        <div class="section">
-            <h2>Channels</h2>
-            <div class="color-box" data-label="REF" style="background-color: red;"></div>
-            <div class="color-box" data-label="BIASOUT" style="background-color: black;"></div>
-            <div class="color-box" data-label="Ch1" style="background-color: yellow;"></div>
-            <div class="color-box" data-label="Ch2" style="background-color: orange;"></div>
-            <div class="color-box" data-label="Ch3" style="background-color: brown;"></div>
-            <div class="color-box" data-label="Ch4" style="background-color: green;"></div>
-            <div class="color-box" data-label="Ch5" style="background-color: purple;"></div>
-            <div class="color-box" data-label="Ch6" style="background-color: blue;"></div>
-            <div class="color-box" data-label="Ch7" style="background-color: grey;"></div>
-            <div class="color-box" data-label="Ch8" style="background-color: white;"></div>
+    </div>
+
+    <!-- Metadata modal -->
+    <div id="metadataModal" class="metadata-modal hidden">
+        <div class="metadata-backdrop" onclick="closeMetadataModal()"></div>
+        <div class="metadata-dialog">
+            <header>
+                <div style="display:flex; align-items:center; justify-content:space-between;">
+                    <div>
+                        <h3 style="margin:0;">Metadata Editor</h3>
+                        <small>Only selected fields will be written to the sidecar JSON.</small>
+                    </div>
+                    <button class="metadata-close" onclick="closeMetadataModal()">&times;</button>
+                </div>
+            </header>
+            <div class="body">
+                <div class="metadata-actions">
+                    <button onclick="loadMetadata()">Load</button>
+                    <button onclick="addMetadataField()">Add field</button>
+                    <button onclick="saveMetadata()">Save</button>
+                </div>
+                <div id="metadataModalFieldList" class="metadata-table"></div>
+                <div id="metadataModalStatus" class="metadata-status"></div>
+            </div>
         </div>
     </div>
     <script>
         window.initialSignalType = "{{ signal_type }}";
     </script>
+    <!-- Updated path to point to static/js/app.js instead of static/app.js -->
     <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>
-
