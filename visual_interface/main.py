@@ -30,5 +30,10 @@ def index():
     return render_template('index.html')
 
 # Main entry point of the application
+if __name__ == '__main__':
+    running = False  # Control variable to manage analysis state
+    collected_data = [[] for _ in range(enabled_channels)]  # Initialize data storage for enabled channels
+    socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
+    
 
 
