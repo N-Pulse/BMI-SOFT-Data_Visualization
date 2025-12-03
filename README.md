@@ -28,6 +28,12 @@ socketio.run(app, host='0.0.0.0', port=5001, debug=False)
 PY
 ```
 
+Or just:
+
+```bash
+python app.py
+```
+
 Keep the terminal open while testing—this is where simulation/hardware logs appear and the process must stay alive while the browser displays data.
 
 ## Using the interface
