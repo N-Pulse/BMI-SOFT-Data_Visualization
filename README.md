@@ -38,8 +38,8 @@ Keep the terminal open while testing—this is where simulation/hardware logs ap
 
 ## Using the interface
 
-1. Open your browser to `http://127.0.0.1:5001/`.
-2. Choose **EEG** or **EMG** at the top. EMG currently supports simulation only.
+1. Open your browser to `http://127.0.0.1:5001/` (or `http://10.181.14.171:5001` - it's more sharp-cut).
+2. Choose **EEG** or **EMG** at the top.
 3. Toggle **Simulation Mode** on if you want synthetic data or file replay. Leave it off for real EEG hardware.
 4. Upload a JSON EEG file created by `scripts/generate_sample_eeg.py` to replay recorded data.
 5. Adjust channel/filter settings as needed.
@@ -48,7 +48,7 @@ Keep the terminal open while testing—this is where simulation/hardware logs ap
    - In simulation mode, the selected signals stream to the chart in real time.
 7. Stop analysis any time with **Stop Analysis**.
 8. Use **Start Calibration** to compute baseline offsets (simulation mode generates synthetic baselines).
-9. Use **Export Data** to download the latest collected samples (CSV or BIDS-compliant EDF within a ZIP). (Currentla in the developpement)
+9. Use **Export Data** to download the latest collected samples (in BIDS format).
 
 ## Generating sample data
 
@@ -56,7 +56,7 @@ Keep the terminal open while testing—this is where simulation/hardware logs ap
 python scripts/generate_sample_eeg.py
 ```
 
-This creates `sample_eeg_data.json` which you can upload under Simulation Mode to test file replay.
+This creates `sample_eeg_data.json` which you can upload under Simulation Mode to test file replay. Similarly with EMG.
 
 ## Notes
 
