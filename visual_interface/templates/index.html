@@ -116,11 +116,27 @@
                         <span id="modeLabel" class="mode-label">Hardware Mode</span>
                         <span class="mode-description">Toggle to enable simulation mode for testing without hardware</span>
                     </div>
+                    <div class="mode-toggle" style="margin-top: 8px;">
+                        <label for="hardwareSourceSelect" style="min-width: 120px;">Hardware Source</label>
+                        <select id="hardwareSourceSelect" onchange="setHardwareSource(this.value)">
+                            <option value="pieeg">PiEEG (BrainFlow)</option>
+                            <option value="dsi_lsl">DSI via LSL</option>
+                        </select>
+                        <span class="mode-description">For DSI, run LSL bridge first and keep signal type on EEG</span>
+                    </div>
                     <div id="fileUploadSection" style="display: none; margin-top: 20px;">
+                        <h3>Upload Session Folder (Recommended)</h3>
+                        <p class="file-description">Select a BIDS-like folder containing signal (`.fif/.edf/.xdf/.json`) and companion files (`events.tsv`, `events.json`, `channels.tsv`).</p>
+                        <input type="file" id="sessionFolderInput" webkitdirectory directory multiple onchange="uploadSessionFolder()">
+                        <div id="sessionInfoPanel" class="file-status"></div>
                         <h3>Upload EEG/EMG Data File</h3>
-                        <p class="file-description">Upload a JSON, FIF or XDF file containing EEG or EMG data to replay in simulation mode</p>
-                        <input type="file" id="eegFileInput" accept=".json,.fif,.xdf,.xdf.part" onchange="uploadEEGFile()">
+                        <p class="file-description">Upload a JSON, FIF, or XDF recording to replay in simulation mode</p>
+                        <input type="file" id="eegFileInput" accept=".json,.fif,.edf,.xdf,.xdf.part" onchange="uploadEEGFile()">
                         <div id="fileStatus" class="file-status"></div>
+                        <h3 style="margin-top: 16px;">Upload Events File (Optional)</h3>
+                        <p class="file-description">Upload BIDS events file (`events.tsv`) and optionally `events.json` sidecar</p>
+                        <input type="file" id="eventFileInput" accept=".tsv,.json" onchange="uploadEventsFile()">
+                        <div id="eventFileStatus" class="file-status"></div>
                     </div>
                 </div>
             </div>
