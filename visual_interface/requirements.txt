@@ -6,3 +6,4 @@ scipy==1.11.4
 brainflow==5.10.1
 python-socketio==5.10.0
 pyxdf==1.16.8
+pylsl==1.17.6; python_version < "3.14"
