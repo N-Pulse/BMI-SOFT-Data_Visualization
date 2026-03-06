@@ -368,7 +368,9 @@ input:focus + .slider {
   margin-bottom: 10px;
 }
 
-#eegFileInput {
+#eegFileInput,
+#eventFileInput,
+#sessionFolderInput {
   display: block;
   margin: 10px 0;
   padding: 8px;
@@ -381,7 +383,9 @@ input:focus + .slider {
   cursor: pointer;
 }
 
-#eegFileInput::-webkit-file-upload-button {
+#eegFileInput::-webkit-file-upload-button,
+#eventFileInput::-webkit-file-upload-button,
+#sessionFolderInput::-webkit-file-upload-button {
   background-color: #ff9800;
   color: white;
   border: none;
@@ -391,7 +395,9 @@ input:focus + .slider {
   margin-right: 10px;
 }
 
-#eegFileInput::-webkit-file-upload-button:hover {
+#eegFileInput::-webkit-file-upload-button:hover,
+#eventFileInput::-webkit-file-upload-button:hover,
+#sessionFolderInput::-webkit-file-upload-button:hover {
   background-color: #f57c00;
 }
 
