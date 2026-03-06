@@ -14,7 +14,9 @@ import io
 import zipfile
 import tempfile
 import os
+import csv
 from pathlib import Path
+from pylsl import StreamOutlet
 
 # Configure logging for detailed information during execution
 logging.basicConfig(level=logging.INFO)
@@ -64,7 +66,18 @@ simulation_mode = False
 simulation_data_file = None
 simulation_data_index = 0
 simulation_loaded_data = None
+simulation_loaded_events = {
+    "events": [],
+    "columns": [],
+    "sidecar": {},
+    "source_format": None
+}
+simulation_events_lock = threading.Lock()
 current_signal_type = 'eeg'
+hardware_source = "pieeg"  # pieeg | dsi_lsl
+lsl_stream_type = os.environ.get("DSI_LSL_TYPE", "EEG")
+lsl_stream_name = os.environ.get("DSI_LSL_NAME", "")
+lsl_resolve_timeout = float(os.environ.get("DSI_LSL_TIMEOUT", "8"))
 recording_active = False
 recording_paused = False
 recording_data = []
@@ -1027,6 +1040,237 @@ def _load_simulation_from_fif(path):
     )
 
 
+def _load_simulation_from_edf(path):
+    """Load EEG/EMG data from EDF file"""
+    raw = mne.io.read_raw_edf(path, preload=True, verbose='ERROR')
+    picks = mne.pick_types(
+        raw.info,
+        eeg=True,
+        emg=True,
+        eog=True,
+        ecg=True,
+        misc=True,
+        stim=True,
+        exclude=[]
+    )
+    if picks is None or len(picks) == 0:
+        picks = np.arange(raw.info["nchan"])
+
+    data = raw.get_data(picks=picks).astype(np.float32, copy=False)
+    channel_names = [raw.ch_names[idx] for idx in picks]
+    channel_types = [raw.get_channel_types(picks=[idx])[0] for idx in picks]
+
+    emg_count = sum(1 for t in channel_types if t == 'emg')
+    eeg_count = sum(1 for t in channel_types if t == 'eeg')
+    signal_type = 'emg' if emg_count > eeg_count else 'eeg'
+
+    return _build_simulation_payload(
+        data,
+        sampling_rate=float(raw.info.get("sfreq", fs)),
+        signal_type=signal_type,
+        description="Uploaded EDF recording",
+        channel_names=channel_names,
+        source_format='edf'
+    )
+
+
+def _load_simulation_from_uploaded_file(upload_file):
+    """Load simulation payload from a Flask-uploaded file by extension"""
+    if upload_file is None or not upload_file.filename:
+        raise ValueError("No file selected")
+
+    lower_name = Path(upload_file.filename).name.lower()
+    if lower_name.endswith('.json'):
+        return _load_simulation_from_json(upload_file)
+
+    suffix = '.xdf' if (lower_name.endswith('.xdf') or '.xdf.' in lower_name) else Path(lower_name).suffix
+    if suffix not in ('.fif', '.edf', '.xdf'):
+        ext = ''.join(Path(lower_name).suffixes) or suffix or lower_name
+        raise ValueError(f"Unsupported file type: {ext}. Supported: .json, .fif, .edf, .xdf")
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_path = temp_file.name
+            upload_file.save(temp_path)
+        if suffix == '.fif':
+            return _load_simulation_from_fif(temp_path)
+        if suffix == '.edf':
+            return _load_simulation_from_edf(temp_path)
+        return _load_simulation_from_xdf(temp_path)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def _safe_float(value, default=0.0):
+    """Convert value to float, returning default on failure"""
+    try:
+        if value is None:
+            return default
+        text = str(value).strip()
+        if text == "":
+            return default
+        return float(text)
+    except Exception:
+        return default
+
+
+def _build_event_label(row):
+    """Pick a readable event label from common BIDS columns"""
+    keys = ("trial_type", "label", "event_type", "type", "value", "lsl_code", "code")
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return "event"
+
+
+def _build_event_description(row):
+    """Build compact event description from known optional columns"""
+    keys = ("description", "desc", "phase_label", "movement_label", "baseline_label")
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() != "n/a":
+            return text
+    return ""
+
+
+def _parse_events_tsv(upload_file):
+    """Parse BIDS-style events.tsv file into normalized event entries"""
+    content = upload_file.read().decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(content), delimiter="\t")
+    if not reader.fieldnames:
+        raise ValueError("Invalid events.tsv: missing header row")
+    if "onset" not in reader.fieldnames:
+        raise ValueError("Invalid events.tsv: required column 'onset' is missing")
+
+    events = []
+    for idx, row in enumerate(reader):
+        onset = _safe_float(row.get("onset"), default=None)
+        if onset is None:
+            continue
+        duration = _safe_float(row.get("duration"), default=0.0)
+        label = _build_event_label(row)
+        description = _build_event_description(row)
+        code_value = row.get("lsl_code") or row.get("value") or row.get("code")
+        event = {
+            "index": idx,
+            "onset": float(onset),
+            "duration": float(duration),
+            "label": label,
+            "description": description
+        }
+        if code_value is not None and str(code_value).strip() != "":
+            event["code"] = str(code_value).strip()
+        events.append(event)
+
+    events.sort(key=lambda x: x["onset"])
+    return {
+        "events": events,
+        "columns": reader.fieldnames
+    }
+
+
+def _parse_events_json(upload_file):
+    """Parse events sidecar JSON"""
+    try:
+        sidecar = json.loads(upload_file.read().decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("Invalid events.json format") from exc
+    if not isinstance(sidecar, dict):
+        raise ValueError("Invalid events.json: expected a JSON object")
+    return sidecar
+
+
+def _parse_channels_tsv(upload_file):
+    """Parse channels.tsv and return compact summary"""
+    content = upload_file.read().decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(content), delimiter="\t")
+    if not reader.fieldnames:
+        raise ValueError("Invalid channels.tsv: missing header row")
+
+    rows = list(reader)
+    name_col = None
+    for candidate in ("name", "channel", "label"):
+        if candidate in reader.fieldnames:
+            name_col = candidate
+            break
+
+    names = []
+    if name_col:
+        for row in rows:
+            value = row.get(name_col)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                names.append(text)
+
+    return {
+        "columns": reader.fieldnames,
+        "row_count": len(rows),
+        "channel_names": names,
+        "channel_names_preview": names[:24]
+    }
+
+
+def _summarize_events_sidecar(sidecar):
+    """Return compact summary of events sidecar content for UI display"""
+    if not isinstance(sidecar, dict):
+        return {}
+
+    summary = {
+        "top_level_keys": list(sidecar.keys())[:20]
+    }
+
+    protocol = sidecar.get("Protocol")
+    if isinstance(protocol, dict):
+        if "ProtocolVersion" in protocol:
+            summary["protocol_version"] = protocol.get("ProtocolVersion")
+        phase_codes = protocol.get("PhaseCodes")
+        if isinstance(phase_codes, dict):
+            summary["phase_codes"] = phase_codes
+        special_codes = protocol.get("SpecialCodes")
+        if isinstance(special_codes, dict):
+            summary["special_codes"] = special_codes
+        lsl_marker = protocol.get("LSLMarker")
+        if isinstance(lsl_marker, dict):
+            summary["lsl_marker"] = {
+                "column": lsl_marker.get("ColumnName"),
+                "format": lsl_marker.get("CodeFormat")
+            }
+
+    return summary
+
+
+def _score_signal_filename(filename):
+    """Score candidate signal filenames for folder upload detection"""
+    lower = Path(filename).name.lower()
+    if lower.endswith('.fif'):
+        base = 40
+    elif lower.endswith('.edf'):
+        base = 35
+    elif lower.endswith('.xdf') or '.xdf.' in lower:
+        base = 30
+    elif lower.endswith('.json'):
+        base = 20
+    else:
+        return -1
+
+    if any(token in lower for token in ('_eeg', '_emg', 'recording', 'signal')):
+        base += 5
+    if 'sample' in lower:
+        base -= 3
+    return base
+
+
 def read_eeg_data_file_simulation():
     """Read EEG data from uploaded file and replay it in real-time"""
     global collected_data, running, simulation_loaded_data, simulation_data_index, current_stream_sampling_rate
@@ -1049,6 +1293,18 @@ def read_eeg_data_file_simulation():
         channel_lengths = [len(ch) for ch in data_arrays]
         if not channel_lengths or min(channel_lengths) == 0:
             raise ValueError("Uploaded EEG file contains empty channels")
+
+        # Stream only channels currently visible in the UI to reduce CPU/socket load
+        target_channels = 3 if current_signal_type == 'motion' else max(1, int(enabled_channels))
+        if num_channels > target_channels:
+            logging.info(
+                "Uploaded file has %s channels; streaming first %s channels for real-time view",
+                num_channels,
+                target_channels
+            )
+            data_arrays = data_arrays[:target_channels]
+            num_channels = target_channels
+            channel_lengths = channel_lengths[:target_channels]
         
         # Ensure all channels have the same number of samples by truncating to the shortest
         total_samples = min(channel_lengths)
@@ -1205,6 +1461,98 @@ def read_eeg_data_brainflow():
                 logging.info("BrainFlow stream stopped and session released")
         except Exception as e:
             logging.error(f"Error stopping BrainFlow session: {e}")
+
+
+def _resolve_lsl_eeg_stream():
+    """Resolve target LSL stream for DSI hardware mode"""
+    try:
+        from pylsl import resolve_byprop, resolve_streams
+    except ImportError as exc:
+        raise RuntimeError("LSL support requires pylsl. Install with: pip install pylsl") from exc
+
+    timeout = max(1.0, float(lsl_resolve_timeout))
+    stream_type = str(lsl_stream_type or "EEG").strip() or "EEG"
+    stream_name = str(lsl_stream_name or "").strip()
+
+    if stream_name:
+        candidates = resolve_byprop("name", stream_name, timeout=timeout)
+        if stream_type:
+            typed = [s for s in candidates if str(s.type() or "").lower() == stream_type.lower()]
+            if typed:
+                candidates = typed
+        if candidates:
+            return candidates[0]
+
+    candidates = resolve_byprop("type", stream_type, timeout=timeout)
+    if candidates:
+        return candidates[0]
+
+    fallback = resolve_streams(timeout)
+    if not fallback:
+        raise RuntimeError(
+            f"No LSL stream found (type={stream_type}, name={stream_name or 'n/a'}). Start DSI LSL bridge first."
+        )
+
+    eeg_like = [
+        s for s in fallback
+        if str(s.type() or "").lower() in ("eeg", "biosignal")
+        or "eeg" in str(s.name() or "").lower()
+    ]
+    return eeg_like[0] if eeg_like else fallback[0]
+
+
+def read_eeg_data_lsl():
+    """Read EEG data from LSL stream and emit to frontend"""
+    global running, current_stream_sampling_rate
+    inlet = None
+    try:
+        from pylsl import StreamInlet
+
+        info = _resolve_lsl_eeg_stream()
+        inlet = StreamInlet(info, max_buflen=60, recover=True)
+        hw_rate = float(info.nominal_srate()) if info.nominal_srate() else float(fs)
+        if hw_rate <= 0:
+            hw_rate = float(fs)
+
+        update_filter_coefficients(hw_rate)
+        current_stream_sampling_rate = hw_rate / downsample_factor if downsample_factor > 0 else hw_rate
+        samples_per_chunk = compute_chunk_size(hw_rate)
+        logging.info(
+            "LSL stream connected: name=%s type=%s channels=%s nominal_srate=%s",
+            info.name(),
+            info.type(),
+            info.channel_count(),
+            info.nominal_srate()
+        )
+
+        while running:
+            chunk, _ = inlet.pull_chunk(timeout=1.0, max_samples=max(samples_per_chunk, 32))
+            if not chunk:
+                continue
+            arr = np.asarray(chunk, dtype=np.float32)
+            if arr.ndim == 1:
+                arr = arr[:, np.newaxis]
+            if arr.ndim != 2 or arr.size == 0:
+                continue
+
+            # LSL chunk shape [samples, channels] -> [channels, samples]
+            data_transposed = arr.T
+            target_channels = max(1, int(enabled_channels))
+            if data_transposed.shape[0] > target_channels:
+                data_transposed = data_transposed[:target_channels, :]
+
+            process_and_emit_chunk(data_transposed, hw_rate, acquisition_ts=time.time())
+
+    except Exception as e:
+        logging.error(f"LSL stream error: {e}")
+        running = False
+        socketio.emit('error', {'message': f"LSL stream error: {str(e)}"})
+    finally:
+        try:
+            if inlet is not None:
+                inlet.close_stream()
+        except Exception:
+            pass
 
 
 def calibrate():
@@ -1521,6 +1869,30 @@ def set_signal_type():
     })
 
 
+@app.route('/hardware-source', methods=['GET'])
+def get_hardware_source():
+    """Return currently selected hardware source"""
+    return jsonify({
+        "hardware_source": hardware_source,
+        "lsl_stream_type": lsl_stream_type,
+        "lsl_stream_name": lsl_stream_name
+    })
+
+
+@app.route('/set-hardware-source', methods=['POST'])
+def set_hardware_source():
+    """Switch hardware backend (PiEEG vs DSI-LSL)"""
+    global hardware_source
+    if running:
+        return jsonify({"status": "error", "message": "Stop analysis before changing hardware source"}), 409
+    payload = request.get_json(silent=True) or {}
+    source = str(payload.get("hardware_source", hardware_source)).strip().lower()
+    if source not in ("pieeg", "dsi_lsl"):
+        return jsonify({"status": "error", "message": "Invalid hardware source"}), 400
+    hardware_source = source
+    return jsonify({"status": "ok", "hardware_source": hardware_source})
+
+
 @app.route('/start-analysis', methods=['POST'])
 def start_analysis():
     """Start EEG/EMG analysis"""
@@ -1528,20 +1900,14 @@ def start_analysis():
     if running:
         logging.info("Analysis already running")
         return jsonify({"status": "Analysis already running"})
+
+    target = None
     logging.info(f"/start-analysis request received (simulation={simulation_mode}, signal={current_signal_type})")
-    running = True
-    reset_qc_stats()
-    with collected_data_lock:
-        channel_count = 3 if current_signal_type == 'motion' else enabled_channels
-        collected_data[:] = [[] for _ in range(channel_count)]
-    current_stream_sampling_rate = fs / downsample_factor if downsample_factor > 0 else fs
-    mode_label = "SIMULATION" if simulation_mode else "HARDWARE"
-    logging.info(f"Starting analysis ({mode_label}, signal={current_signal_type.upper()}, fs={fs}Hz)")
-    
+
     if simulation_mode:
         if simulation_loaded_data:
             logging.info(f"Starting analysis in FILE SIMULATION mode ({current_signal_type.upper()})")
-            socketio.start_background_task(read_eeg_data_file_simulation)
+            target = read_eeg_data_file_simulation
         else:
             logging.info(f"Starting analysis in SYNTHETIC SIMULATION mode ({current_signal_type.upper()})")
             if current_signal_type == 'emg':
@@ -1550,19 +1916,48 @@ def start_analysis():
                 target = read_motion_data_simulation
             else:
                 target = read_eeg_data_simulation
-            socketio.start_background_task(target)
     else:
         if current_signal_type in ('emg', 'motion'):
             logging.warning(f"{current_signal_type.upper()} hardware mode not supported yet")
             return jsonify({"status": f"{current_signal_type.upper()} hardware mode is not supported. Enable simulation mode."}), 400
-        
-        logging.info("Starting analysis in HARDWARE mode")
-        cleanup_spi_gpio()  # Ensure no conflicts before starting BrainFlow
 
-        if check_gpio_conflicts():
-            return jsonify({"status": "GPIO conflict detected. Please resolve before starting BrainFlow."}), 409
-        socketio.start_background_task(read_eeg_data_brainflow)
-    
+        if hardware_source == "dsi_lsl":
+            try:
+                info = _resolve_lsl_eeg_stream()
+                logging.info(
+                    "LSL preflight resolved stream: name=%s type=%s channels=%s nominal_srate=%s",
+                    info.name(),
+                    info.type(),
+                    info.channel_count(),
+                    info.nominal_srate()
+                )
+            except Exception as exc:
+                logging.error(f"LSL preflight failed: {exc}")
+                return jsonify({"status": "error", "message": f"DSI LSL stream is not ready: {str(exc)}"}), 400
+            logging.info("Starting analysis in HARDWARE mode (DSI via LSL)")
+            target = read_eeg_data_lsl
+        else:
+            logging.info("Starting analysis in HARDWARE mode (PiEEG/BrainFlow)")
+            cleanup_spi_gpio()  # Ensure no conflicts before starting BrainFlow
+            if check_gpio_conflicts():
+                return jsonify({"status": "GPIO conflict detected. Please resolve before starting BrainFlow."}), 409
+            target = read_eeg_data_brainflow
+
+    running = True
+    reset_qc_stats()
+    with collected_data_lock:
+        channel_count = 3 if current_signal_type == 'motion' else enabled_channels
+        collected_data[:] = [[] for _ in range(channel_count)]
+    current_stream_sampling_rate = fs / downsample_factor if downsample_factor > 0 else fs
+    mode_label = "SIMULATION" if simulation_mode else "HARDWARE"
+    logging.info(f"Starting analysis ({mode_label}, signal={current_signal_type.upper()}, fs={fs}Hz)")
+    try:
+        socketio.start_background_task(target)
+    except Exception as exc:
+        running = False
+        logging.error(f"Failed to start analysis task: {exc}")
+        return jsonify({"status": "error", "message": f"Failed to start analysis: {str(exc)}"}), 500
+
     return jsonify({"status": "Analysis started"})
 
 @app.route('/stop-analysis', methods=['POST'])
@@ -1571,7 +1966,8 @@ def stop_analysis():
     global running
     running = False
     time.sleep(0.3)  # brief pause to let threads exit
-    cleanup_spi_gpio()
+    if hardware_source == "pieeg":
+        cleanup_spi_gpio()
     socketio.emit('analysis_stopped')  # Notify frontend to update the settings
     logging.info("Analysis stopped")
     return jsonify({"status": "Analysis stopped"})
@@ -1941,37 +2337,7 @@ def upload_simulation_data():
         if file.filename == '':
             return jsonify({"status": "error", "message": "No file selected"}), 400
 
-        filename = file.filename
-        lower_name = filename.lower()
-
-        if lower_name.endswith('.json'):
-            payload = _load_simulation_from_json(file)
-        elif lower_name.endswith('.fif'):
-            temp_path = None
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.fif') as temp_file:
-                    temp_path = temp_file.name
-                    file.save(temp_path)
-                payload = _load_simulation_from_fif(temp_path)
-            finally:
-                if temp_path and os.path.exists(temp_path):
-                    os.remove(temp_path)
-        elif lower_name.endswith('.xdf') or '.xdf.' in lower_name:
-            temp_path = None
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.xdf') as temp_file:
-                    temp_path = temp_file.name
-                    file.save(temp_path)
-                payload = _load_simulation_from_xdf(temp_path)
-            finally:
-                if temp_path and os.path.exists(temp_path):
-                    os.remove(temp_path)
-        else:
-            ext = ''.join(Path(lower_name).suffixes) or Path(lower_name).suffix or lower_name
-            return jsonify({
-                "status": "error",
-                "message": f"Unsupported file type: {ext}. Supported: .json, .fif, .xdf"
-            }), 400
+        payload = _load_simulation_from_uploaded_file(file)
 
         simulation_loaded_data = payload
         simulation_data_index = 0
@@ -1994,8 +2360,151 @@ def upload_simulation_data():
         
     except ValueError as e:
         return jsonify({"status": "error", "message": str(e)}), 400
+    except RuntimeError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
-        logging.error(f"Error uploading simulation data: {e}")
+        logging.exception("Error uploading simulation data")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/upload-simulation-session', methods=['POST'])
+def upload_simulation_session():
+    """Upload a BIDS-like folder selection and auto-load signal + events metadata"""
+    global simulation_loaded_data, simulation_data_index, simulation_loaded_events
+
+    try:
+        files = [f for f in request.files.getlist('files') if f and f.filename]
+        if not files:
+            return jsonify({"status": "error", "message": "No files provided"}), 400
+
+        signal_file = None
+        signal_score = -1
+        events_tsv_file = None
+        events_json_file = None
+        channels_tsv_file = None
+
+        for file in files:
+            lower = Path(file.filename).name.lower()
+            score = _score_signal_filename(lower)
+            if score > signal_score:
+                signal_file = file
+                signal_score = score
+
+            if lower.endswith('_events.tsv') or lower == 'events.tsv':
+                events_tsv_file = file
+            elif lower.endswith('_events.json') or lower == 'events.json':
+                events_json_file = file
+            elif lower.endswith('channels.tsv') or lower == 'channels.tsv':
+                channels_tsv_file = file
+
+        if signal_file is None:
+            return jsonify({
+                "status": "error",
+                "message": "No signal file found in uploaded folder. Supported signal files: .fif, .edf, .xdf, .json"
+            }), 400
+
+        payload = _load_simulation_from_uploaded_file(signal_file)
+        simulation_loaded_data = payload
+        simulation_data_index = 0
+
+        events_payload = {
+            "events": [],
+            "columns": [],
+            "sidecar": {},
+            "source_format": None
+        }
+        channels_info = {}
+
+        if events_tsv_file is not None:
+            parsed_events = _parse_events_tsv(events_tsv_file)
+            events_payload["events"] = parsed_events["events"]
+            events_payload["columns"] = parsed_events["columns"]
+            events_payload["source_format"] = "tsv"
+
+        if events_json_file is not None:
+            events_payload["sidecar"] = _parse_events_json(events_json_file)
+
+        if channels_tsv_file is not None:
+            channels_info = _parse_channels_tsv(channels_tsv_file)
+
+        with simulation_events_lock:
+            simulation_loaded_events = events_payload
+
+        metadata = payload.get("metadata", {})
+        response = {
+            "status": "success",
+            "message": "Session folder loaded successfully",
+            "metadata": metadata,
+            "events_loaded": len(events_payload.get("events", [])),
+            "event_columns": events_payload.get("columns", []),
+            "events": events_payload.get("events", []),
+            "has_events_sidecar": bool(events_payload.get("sidecar")),
+            "events_sidecar_summary": _summarize_events_sidecar(events_payload.get("sidecar", {})),
+            "channels_info": channels_info,
+            "detected_files": {
+                "signal": signal_file.filename if signal_file else None,
+                "events_tsv": events_tsv_file.filename if events_tsv_file else None,
+                "events_json": events_json_file.filename if events_json_file else None,
+                "channels_tsv": channels_tsv_file.filename if channels_tsv_file else None,
+                "total_uploaded": len(files)
+            }
+        }
+        return jsonify(response)
+
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except RuntimeError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        logging.exception("Error uploading simulation session")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/upload-simulation-events', methods=['POST'])
+def upload_simulation_events():
+    """Upload events.tsv / events.json for simulation replay overlays"""
+    global simulation_loaded_events
+
+    try:
+        if 'file' not in request.files:
+            return jsonify({"status": "error", "message": "No file provided"}), 400
+
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"status": "error", "message": "No file selected"}), 400
+
+        lower_name = file.filename.lower()
+        with simulation_events_lock:
+            if lower_name.endswith('.tsv'):
+                parsed = _parse_events_tsv(file)
+                simulation_loaded_events["events"] = parsed["events"]
+                simulation_loaded_events["columns"] = parsed["columns"]
+                simulation_loaded_events["source_format"] = "tsv"
+                message = f"Loaded events.tsv with {len(parsed['events'])} events"
+            elif lower_name.endswith('.json'):
+                sidecar = _parse_events_json(file)
+                simulation_loaded_events["sidecar"] = sidecar
+                message = "Loaded events.json sidecar"
+            else:
+                return jsonify({
+                    "status": "error",
+                    "message": "Unsupported event file type. Supported: .tsv, .json"
+                }), 400
+
+            payload = {
+                "status": "success",
+                "message": message,
+                "events_loaded": len(simulation_loaded_events.get("events", [])),
+                "columns": simulation_loaded_events.get("columns", []),
+                "has_sidecar": bool(simulation_loaded_events.get("sidecar")),
+                "events": simulation_loaded_events.get("events", [])
+            }
+            return jsonify(payload)
+
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        logging.exception("Error uploading simulation events")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/sample-emg-data')
@@ -2012,10 +2521,11 @@ def sample_emg_data():
 
 # Main entry point of the application
 if __name__ == '__main__':
+    server_port = int(os.environ.get("PORT", "5001"))
     socketio.run(
         app,
         host='0.0.0.0',
-        port=5001,
+        port=server_port,
         allow_unsafe_werkzeug=True,
         debug=False,
         use_reloader=False
