@@ -931,7 +931,10 @@ def _load_simulation_from_xdf(path):
     except ImportError as exc:
         raise RuntimeError("XDF support requires pyxdf. Install it with: pip install pyxdf") from exc
 
-    streams, _ = pyxdf.load_xdf(path)
+    try:
+        streams, _ = pyxdf.load_xdf(path)
+    except Exception as exc:
+        raise ValueError(f"Failed to parse XDF file: {exc}") from exc
     data_stream = _select_xdf_data_stream(streams)
     if data_stream is None:
         raise ValueError("No numeric EEG/EMG stream found in XDF file")
