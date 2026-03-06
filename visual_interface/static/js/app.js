@@ -22,18 +22,29 @@ let featureTimeChart = null;
 let featureHistory = [];
 let isSimulationMode = false;
 let currentSignalType = 'eeg';
+let currentHardwareSource = 'pieeg';
 let chartMode = 'overlap';
 let isRecording = false;
 let isRecordingPaused = false;
 let markers = [];
+let simulationEvents = [];
+let simulationDurationSec = 0;
+let simulationEventColumns = [];
+let simulationSidecarSummary = {};
+let simulationChannelsInfo = {};
 let metadataFields = [];
 let metadataDragIndex = null;
 const BANDPOWER_Y_MAX = 2000; // fixed y-axis for band power chart
 const waveformWindowSec = 8; // seconds of data to keep in the live view
+const MAX_EVENT_OVERLAY_LINES = 120;
+const MAX_RENDER_POINTS = 1200;
+const FEATURE_UPDATE_INTERVAL_MS = 400;
 
 let waveformBuffers = Array.from({ length: 8 }, () => []);
 let lastSampleTimestamp = 0;
 let stackedOffsets = [];
+let currentWindowStartSec = 0;
+let lastFeatureUpdateMs = 0;
 
 // Initialize the UI on page load
 document.addEventListener('DOMContentLoaded', () => {
@@ -47,7 +58,10 @@ document.addEventListener('DOMContentLoaded', () => {
   initializeFeatureCharts();
   updateSignalUI();
   updateSettings();
+  loadHardwareSource();
   loadMetadata();
+  renderMarkers();
+  renderSessionSummary();
 });
 
 function parseJsonResponse(response) {
@@ -164,6 +178,75 @@ const stackedLabelPlugin = {
   }
 };
 
+const eventOverlayPlugin = {
+  id: 'eventOverlay',
+  afterDatasetsDraw(chartInstance) {
+    if (!simulationEvents.length) return;
+    const { ctx, chartArea, scales } = chartInstance;
+    if (!ctx || !chartArea || !scales?.x) return;
+
+    const visible = getVisibleSimulationEvents(currentWindowStartSec, waveformWindowSec);
+    if (!visible.length) return;
+
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255, 193, 7, 0.85)';
+    ctx.fillStyle = 'rgba(255, 193, 7, 0.95)';
+    ctx.lineWidth = 1;
+    ctx.font = '11px Arial';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+
+    visible.forEach((evt, idx) => {
+      const xRelative = evt.plotTime - currentWindowStartSec;
+      const x = scales.x.getPixelForValue(xRelative);
+      if (!Number.isFinite(x) || x < chartArea.left || x > chartArea.right) return;
+      ctx.beginPath();
+      ctx.moveTo(x, chartArea.top);
+      ctx.lineTo(x, chartArea.bottom);
+      ctx.stroke();
+      if (idx < 24) {
+        const label = `${evt.label}`;
+        ctx.fillText(label, x + 3, chartArea.top + 4 + ((idx % 8) * 12));
+      }
+    });
+
+    ctx.restore();
+  }
+};
+
+function getVisibleSimulationEvents(windowStart, windowLength) {
+  if (!simulationEvents.length) return [];
+  const windowEnd = windowStart + windowLength;
+  const duration = Number(simulationDurationSec) || 0;
+  const visible = [];
+
+  simulationEvents.forEach(evt => {
+    const onset = Number(evt.onset);
+    if (!Number.isFinite(onset)) return;
+
+    if (duration > 0) {
+      let cycle = Math.floor((windowStart - onset) / duration);
+      if (!Number.isFinite(cycle)) cycle = 0;
+      let plotTime = onset + cycle * duration;
+      while (plotTime < windowStart) {
+        cycle += 1;
+        plotTime = onset + cycle * duration;
+      }
+      while (plotTime <= windowEnd) {
+        visible.push({ ...evt, plotTime });
+        if (visible.length >= MAX_EVENT_OVERLAY_LINES) break;
+        cycle += 1;
+        plotTime = onset + cycle * duration;
+      }
+    } else if (onset >= windowStart && onset <= windowEnd) {
+      visible.push({ ...evt, plotTime: onset });
+    }
+  });
+
+  visible.sort((a, b) => a.plotTime - b.plotTime);
+  return visible.slice(0, MAX_EVENT_OVERLAY_LINES);
+}
+
 function buildChartOptions() {
   const range = getYAxisRange();
   return {
@@ -226,7 +309,7 @@ function initializeChart() {
       }))
     },
     options: buildChartOptions(),
-    plugins: [stackedLabelPlugin]
+    plugins: [stackedLabelPlugin, eventOverlayPlugin]
   });
   renderWaveform();
 }
@@ -331,6 +414,43 @@ function setSignalType(type) {
     .catch(error => {
       console.error('[client] Error changing signal type:', error);
       alert(error.message || 'Failed to change signal type');
+    });
+}
+
+function loadHardwareSource() {
+  const select = document.getElementById('hardwareSourceSelect');
+  if (!select) return;
+  fetch('/hardware-source')
+    .then(parseJsonResponse)
+    .then(data => {
+      currentHardwareSource = data.hardware_source || 'pieeg';
+      select.value = currentHardwareSource;
+    })
+    .catch(error => {
+      console.error('[client] Error loading hardware source:', error);
+    });
+}
+
+function setHardwareSource(source) {
+  const select = document.getElementById('hardwareSourceSelect');
+  fetch('/set-hardware-source', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hardware_source: source })
+  })
+    .then(parseJsonResponse)
+    .then(data => {
+      currentHardwareSource = data.hardware_source || source;
+      if (select) {
+        select.value = currentHardwareSource;
+      }
+    })
+    .catch(error => {
+      console.error('[client] Error setting hardware source:', error);
+      if (select) {
+        select.value = currentHardwareSource;
+      }
+      alert(error.message || 'Failed to set hardware source');
     });
 }
 
@@ -443,11 +563,12 @@ function uploadEEGFile() {
   const isSupported =
     lowerName.endsWith('.json') ||
     lowerName.endsWith('.fif') ||
+    lowerName.endsWith('.edf') ||
     lowerName.endsWith('.xdf') ||
     lowerName.includes('.xdf.');
 
   if (!isSupported) {
-    fileStatus.textContent = 'Error: Supported formats are .json, .fif, .xdf';
+    fileStatus.textContent = 'Error: Supported formats are .json, .fif, .edf, .xdf';
     fileStatus.style.color = '#f44336';
     return;
   }
@@ -466,6 +587,7 @@ function uploadEEGFile() {
     .then(data => {
       if (data.status === 'success') {
         const metadata = data.metadata;
+        simulationDurationSec = Number(metadata.duration_seconds) || 0;
         fileStatus.innerHTML = `
           <strong>✓ File loaded successfully!</strong><br>
           Channels: ${metadata.num_channels}<br>
@@ -474,6 +596,9 @@ function uploadEEGFile() {
           Sampling Rate: ${metadata.sampling_rate} Hz
         `;
         fileStatus.style.color = '#4CAF50';
+        renderWaveform();
+        renderMarkers();
+        renderSessionSummary();
       } else {
         fileStatus.textContent = `Error: ${data.message}`;
         fileStatus.style.color = '#f44336';
@@ -481,6 +606,167 @@ function uploadEEGFile() {
     })
     .catch(error => {
       console.error('[client] Error uploading file:', error);
+      const message =
+        (error && typeof error === 'object' && error.message)
+          ? error.message
+          : 'Upload failed. Check server logs.';
+      fileStatus.textContent = `Error: ${message}`;
+      fileStatus.style.color = '#f44336';
+    });
+}
+
+function uploadSessionFolder() {
+  const folderInput = document.getElementById('sessionFolderInput');
+  const fileStatus = document.getElementById('fileStatus');
+  const eventStatus = document.getElementById('eventFileStatus');
+  if (!folderInput || !fileStatus) return;
+
+  const files = folderInput.files ? Array.from(folderInput.files) : [];
+  if (!files.length) {
+    fileStatus.textContent = 'No folder files selected';
+    fileStatus.style.color = '#f44336';
+    return;
+  }
+
+  fileStatus.textContent = `Uploading folder (${files.length} files)...`;
+  fileStatus.style.color = '#ff9800';
+  if (eventStatus) {
+    eventStatus.textContent = 'Parsing session files...';
+    eventStatus.style.color = '#ff9800';
+  }
+
+  const formData = new FormData();
+  files.forEach(file => {
+    const relative = file.webkitRelativePath || file.name;
+    formData.append('files', file, relative);
+  });
+
+  fetch('/upload-simulation-session', {
+    method: 'POST',
+    body: formData
+  })
+    .then(parseJsonResponse)
+    .then(data => {
+      if (data.status !== 'success') {
+        fileStatus.textContent = `Error: ${data.message}`;
+        fileStatus.style.color = '#f44336';
+        if (eventStatus) {
+          eventStatus.textContent = '';
+        }
+        return;
+      }
+
+      const metadata = data.metadata || {};
+      simulationDurationSec = Number(metadata.duration_seconds) || 0;
+      simulationEvents = Array.isArray(data.events)
+        ? data.events.map(evt => ({
+            onset: Number(evt.onset) || 0,
+            duration: Number(evt.duration) || 0,
+            label: evt.label || 'event',
+            description: evt.description || '',
+            code: evt.code || ''
+          }))
+        : [];
+      simulationEventColumns = Array.isArray(data.event_columns) ? data.event_columns : [];
+      simulationSidecarSummary = data.events_sidecar_summary || {};
+      simulationChannelsInfo = data.channels_info || {};
+
+      fileStatus.innerHTML = `
+        <strong>✓ Session loaded</strong><br>
+        Signal: ${escapeHtml(data.detected_files?.signal || 'n/a')}<br>
+        Channels: ${metadata.num_channels || '--'}<br>
+        Duration: ${metadata.duration_seconds || '--'}s<br>
+        Sampling Rate: ${metadata.sampling_rate || '--'} Hz
+      `;
+      fileStatus.style.color = '#4CAF50';
+
+      if (eventStatus) {
+        eventStatus.innerHTML = `
+          <strong>✓ Events parsed</strong><br>
+          Events: ${Number(data.events_loaded) || 0}<br>
+          Events sidecar: ${data.has_events_sidecar ? 'yes' : 'no'}
+        `;
+        eventStatus.style.color = '#4CAF50';
+      }
+
+      renderMarkers();
+      renderWaveform();
+      renderSessionSummary();
+    })
+    .catch(error => {
+      console.error('[client] Error uploading session folder:', error);
+      const message =
+        (error && typeof error === 'object' && error.message)
+          ? error.message
+          : 'Upload failed. Check server logs.';
+      fileStatus.textContent = `Error: ${message}`;
+      fileStatus.style.color = '#f44336';
+      if (eventStatus) {
+        eventStatus.textContent = '';
+      }
+    });
+}
+
+function uploadEventsFile() {
+  const fileInput = document.getElementById('eventFileInput');
+  const fileStatus = document.getElementById('eventFileStatus');
+  if (!fileInput || !fileStatus) return;
+
+  if (!fileInput.files || fileInput.files.length === 0) {
+    fileStatus.textContent = 'No events file selected';
+    fileStatus.style.color = '#f44336';
+    return;
+  }
+
+  const file = fileInput.files[0];
+  const lowerName = file.name.toLowerCase();
+  if (!(lowerName.endsWith('.tsv') || lowerName.endsWith('.json'))) {
+    fileStatus.textContent = 'Error: Supported event formats are .tsv and .json';
+    fileStatus.style.color = '#f44336';
+    return;
+  }
+
+  fileStatus.textContent = 'Uploading events...';
+  fileStatus.style.color = '#ff9800';
+
+  const formData = new FormData();
+  formData.append('file', file);
+
+  fetch('/upload-simulation-events', {
+    method: 'POST',
+    body: formData
+  })
+    .then(parseJsonResponse)
+    .then(data => {
+      if (data.status === 'success') {
+        if (Array.isArray(data.events)) {
+          simulationEvents = data.events
+            .map(evt => ({
+              onset: Number(evt.onset) || 0,
+              duration: Number(evt.duration) || 0,
+              label: evt.label || 'event',
+              description: evt.description || '',
+              code: evt.code || ''
+            }))
+            .sort((a, b) => a.onset - b.onset);
+        }
+        simulationEventColumns = Array.isArray(data.columns) ? data.columns : simulationEventColumns;
+        simulationSidecarSummary = data.events_sidecar_summary || simulationSidecarSummary;
+        fileStatus.innerHTML = `
+          <strong>✓ ${escapeHtml(data.message || 'Events loaded')}</strong><br>
+          Events loaded: ${Number(data.events_loaded) || 0}
+        `;
+        fileStatus.style.color = '#4CAF50';
+        renderMarkers();
+        renderWaveform();
+        renderSessionSummary();
+      } else {
+        fileStatus.textContent = `Error: ${data.message}`;
+        fileStatus.style.color = '#f44336';
+      }
+    })
+    .catch(error => {
+      console.error('[client] Error uploading events file:', error);
       const message =
         (error && typeof error === 'object' && error.message)
           ? error.message
@@ -643,9 +929,71 @@ function addMarker() {
 function renderMarkers() {
   const list = document.getElementById('markerList');
   if (!list) return;
-  list.innerHTML = markers
-    .map(m => `<div class="marker-item"><span>${m.label}</span><span>${m.offset.toFixed(2)}s</span></div>`)
-    .join('');
+  const sections = [];
+
+  if (simulationEvents.length) {
+    const preview = simulationEvents.slice(0, 40);
+    const simRows = preview
+      .map(evt => {
+        const onset = (Number(evt.onset) || 0).toFixed(2);
+        const duration = Number(evt.duration || 0).toFixed(2);
+        const codePart = evt.code ? ` [${evt.code}]` : '';
+        const descPart = evt.description ? ` - ${evt.description}` : '';
+        const left = `${evt.label}${codePart}${descPart}`;
+        const right = `${onset}s / ${duration}s`;
+        return `<div class="marker-item"><span>${escapeHtml(left)}</span><span>${escapeHtml(right)}</span></div>`;
+      })
+      .join('');
+    const extra = simulationEvents.length > preview.length
+      ? `<div class="marker-item"><span>...</span><span>+${simulationEvents.length - preview.length} more</span></div>`
+      : '';
+    sections.push(`<div class="marker-item"><strong>Loaded events</strong><span>${simulationEvents.length}</span></div>${simRows}${extra}`);
+  }
+
+  if (markers.length) {
+    const recRows = markers
+      .map(m => `<div class="marker-item"><span>${escapeHtml(m.label)}</span><span>${Number(m.offset || 0).toFixed(2)}s</span></div>`)
+      .join('');
+    sections.push(`<div class="marker-item"><strong>Manual markers</strong><span>${markers.length}</span></div>${recRows}`);
+  }
+
+  list.innerHTML = sections.length
+    ? sections.join('')
+    : '<div class="marker-item"><span>No events/markers loaded</span><span>--</span></div>';
+}
+
+function renderSessionSummary() {
+  const panel = document.getElementById('sessionInfoPanel');
+  if (!panel) return;
+
+  const parts = [];
+  if (simulationEventColumns.length) {
+    parts.push(`Event columns: ${escapeHtml(simulationEventColumns.join(', '))}`);
+  }
+
+  const previewNames = simulationChannelsInfo?.channel_names_preview || [];
+  if (Array.isArray(previewNames) && previewNames.length) {
+    const suffix = (simulationChannelsInfo.row_count || 0) > previewNames.length
+      ? ` ... (+${simulationChannelsInfo.row_count - previewNames.length})`
+      : '';
+    parts.push(`Channels: ${escapeHtml(previewNames.join(', '))}${escapeHtml(suffix)}`);
+  }
+
+  if (simulationSidecarSummary && Object.keys(simulationSidecarSummary).length) {
+    if (simulationSidecarSummary.protocol_version !== undefined) {
+      parts.push(`Protocol version: ${escapeHtml(simulationSidecarSummary.protocol_version)}`);
+    }
+    if (simulationSidecarSummary.lsl_marker?.format) {
+      parts.push(`LSL code format: ${escapeHtml(simulationSidecarSummary.lsl_marker.format)}`);
+    }
+  }
+
+  if (!parts.length) {
+    panel.innerHTML = '<strong>Session info</strong><br>No extra session metadata loaded yet.';
+    return;
+  }
+
+  panel.innerHTML = `<strong>Session info</strong><br>${parts.join('<br>')}`;
 }
 
 // BIDS metadata editor helpers
@@ -844,6 +1192,11 @@ function saveMetadata(silent = false) {
 // Socket.IO event handlers
 socket.on('connect', () => console.log('[client] Socket.IO connected'));
 socket.on('disconnect', () => console.log('[client] Socket.IO disconnected'));
+socket.on('error', payload => {
+  const message = payload && payload.message ? payload.message : 'Backend error';
+  console.error('[client] Backend error:', payload);
+  alert(message);
+});
 
 socket.on('analysis_stopped', () => {
   document.getElementById('startBtn').disabled = false;
@@ -923,6 +1276,7 @@ function renderWaveform() {
   const enabled = getEnabledChannels();
   syncWaveformBuffers(enabled);
   const windowStart = Math.max(0, lastSampleTimestamp - waveformWindowSec);
+  currentWindowStartSec = windowStart;
   const layout = chartMode === 'stacked' ? computeStackedLayout(enabled, windowStart) : null;
   const offsets = chartMode === 'stacked' && layout ? layout.offsets : [];
   stackedOffsets = offsets;
@@ -931,10 +1285,11 @@ function renderWaveform() {
     dataset.hidden = idx >= enabled ? true : !channelVisibility[idx];
     const buffer = waveformBuffers[idx] || [];
     const visiblePoints = buffer.filter(pt => pt.x >= windowStart);
+    const decimatedPoints = decimatePoints(visiblePoints, MAX_RENDER_POINTS);
     const renderPoints =
       chartMode === 'stacked'
-        ? visiblePoints.map(pt => ({ x: pt.x - windowStart, y: pt.y + (offsets[idx] || 0) }))
-        : visiblePoints.map(pt => ({ x: pt.x - windowStart, y: pt.y }));
+        ? decimatedPoints.map(pt => ({ x: pt.x - windowStart, y: pt.y + (offsets[idx] || 0) }))
+        : decimatedPoints.map(pt => ({ x: pt.x - windowStart, y: pt.y }));
     dataset.data = renderPoints;
     dataset.borderWidth = chartMode === 'stacked' ? 1.2 : 1.6;
   });
@@ -957,6 +1312,22 @@ function renderWaveform() {
     chart.options.layout = { padding: { left: 0, right: 0, top: 0, bottom: 0 } };
   }
   chart.update('none');
+}
+
+function decimatePoints(points, maxPoints) {
+  if (!Array.isArray(points) || points.length <= maxPoints) {
+    return points || [];
+  }
+  const step = Math.ceil(points.length / maxPoints);
+  const reduced = [];
+  for (let i = 0; i < points.length; i += step) {
+    reduced.push(points[i]);
+  }
+  const lastPoint = points[points.length - 1];
+  if (reduced[reduced.length - 1] !== lastPoint) {
+    reduced.push(lastPoint);
+  }
+  return reduced;
 }
 
 function computeStackedLayout(enabledChannels, windowStart) {
@@ -1021,7 +1392,11 @@ function updateMetricsAndFeatures(channels, samplingRate) {
     qualityOverlay.style.display = quality < 0.35 ? 'block' : 'none';
   }
 
-  updateFeatureCharts(channels, samplingRate, avgPower);
+  const now = Date.now();
+  if (now - lastFeatureUpdateMs >= FEATURE_UPDATE_INTERVAL_MS) {
+    lastFeatureUpdateMs = now;
+    updateFeatureCharts(channels, samplingRate, avgPower);
+  }
 }
 
 function computeActivation(channels) {
