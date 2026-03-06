@@ -481,7 +481,11 @@ function uploadEEGFile() {
     })
     .catch(error => {
       console.error('[client] Error uploading file:', error);
-      fileStatus.textContent = 'Error uploading file. Check console for details.';
+      const message =
+        (error && typeof error === 'object' && error.message)
+          ? error.message
+          : 'Upload failed. Check server logs.';
+      fileStatus.textContent = `Error: ${message}`;
       fileStatus.style.color = '#f44336';
     });
 }
