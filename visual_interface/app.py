@@ -14,6 +14,7 @@ import io
 import zipfile
 import tempfile
 import os
+from pathlib import Path
 
 # Configure logging for detailed information during execution
 logging.basicConfig(level=logging.INFO)
@@ -784,6 +785,245 @@ def generate_sample_emg(sampling_rate=250, duration_seconds=5):
     }
     return {"metadata": metadata, "data": data.tolist()}
 
+def _normalize_simulation_arrays(data_arrays):
+    """Normalize uploaded channel arrays into numeric 1-D numpy arrays with equal length"""
+    if data_arrays is None:
+        raise ValueError("Uploaded file does not contain channel data")
+
+    normalized = []
+    for idx, channel in enumerate(data_arrays):
+        try:
+            arr = np.asarray(channel, dtype=np.float32).reshape(-1)
+        except Exception as exc:
+            raise ValueError(f"Channel {idx + 1} is not numeric: {exc}") from exc
+        if arr.size == 0:
+            continue
+        normalized.append(arr)
+
+    if not normalized:
+        raise ValueError("Uploaded file contains empty channels")
+
+    min_length = min(arr.size for arr in normalized)
+    if min_length <= 0:
+        raise ValueError("Uploaded file contains empty channels")
+    if any(arr.size != min_length for arr in normalized):
+        logging.warning("Channel lengths differ. Truncating all channels to %s samples.", min_length)
+    normalized = [np.nan_to_num(arr[:min_length], nan=0.0, posinf=0.0, neginf=0.0) for arr in normalized]
+    return normalized
+
+
+def _build_simulation_payload(data_arrays, sampling_rate, signal_type='eeg', description='', channel_names=None, source_format='json'):
+    """Build simulation payload compatible with the file replay loop"""
+    normalized = _normalize_simulation_arrays(data_arrays)
+    num_channels = len(normalized)
+    num_samples = int(normalized[0].size)
+    if not channel_names or len(channel_names) != num_channels:
+        channel_names = [f"CH{i + 1}" for i in range(num_channels)]
+
+    sampling_rate = float(sampling_rate) if sampling_rate else float(fs)
+    if sampling_rate <= 0:
+        sampling_rate = float(fs)
+
+    metadata = {
+        "num_channels": num_channels,
+        "num_samples": num_samples,
+        "sampling_rate": sampling_rate,
+        "duration_seconds": round(num_samples / sampling_rate, 3) if sampling_rate > 0 else 0,
+        "signal_type": signal_type or "eeg",
+        "description": description or f"Uploaded {source_format.upper()} recording",
+        "channel_names": channel_names,
+        "source_format": source_format
+    }
+    return {"metadata": metadata, "data": normalized}
+
+
+def _infer_signal_type_from_names(channel_names, fallback='eeg'):
+    """Infer signal type from channel labels"""
+    if not channel_names:
+        return fallback
+    lowered = [str(name).strip().lower() for name in channel_names]
+    emg_hits = sum(1 for name in lowered if name.startswith(("aux", "emg", "exg")))
+    eeg_hits = sum(1 for name in lowered if name.startswith(("fp", "f", "c", "p", "o", "t", "af", "cp", "fc", "cz", "fz", "pz")))
+    if emg_hits > eeg_hits:
+        return "emg"
+    return fallback
+
+
+def _load_simulation_from_json(upload_file):
+    """Load simulation payload from JSON file"""
+    try:
+        payload = json.loads(upload_file.read().decode('utf-8'))
+    except json.JSONDecodeError as exc:
+        raise ValueError("Invalid JSON format") from exc
+
+    if 'data' not in payload:
+        raise ValueError("Invalid JSON file. Expected top-level 'data' field.")
+
+    metadata = payload.get('metadata', {}) if isinstance(payload.get('metadata', {}), dict) else {}
+    channel_names = metadata.get("channel_names")
+    signal_type = metadata.get("signal_type", current_signal_type)
+    description = metadata.get("description", "Uploaded JSON recording")
+    sampling_rate = metadata.get("sampling_rate", fs)
+    return _build_simulation_payload(
+        payload.get('data'),
+        sampling_rate=sampling_rate,
+        signal_type=signal_type,
+        description=description,
+        channel_names=channel_names,
+        source_format='json'
+    )
+
+
+def _extract_xdf_channel_labels(stream, expected_count):
+    """Extract channel labels from XDF stream metadata when available"""
+    labels = []
+    try:
+        ch_nodes = stream["info"]["desc"][0]["channels"][0]["channel"]
+        for idx, node in enumerate(ch_nodes):
+            label = (
+                (node.get("label", [None])[0] if isinstance(node.get("label"), list) else node.get("label"))
+                or (node.get("name", [None])[0] if isinstance(node.get("name"), list) else node.get("name"))
+                or f"CH{idx + 1}"
+            )
+            labels.append(str(label))
+    except Exception:
+        labels = []
+
+    if len(labels) < expected_count:
+        labels.extend([f"CH{i + 1}" for i in range(len(labels), expected_count)])
+    return labels[:expected_count]
+
+
+def _select_xdf_data_stream(streams):
+    """Choose the most likely numeric EEG/EMG stream from XDF content"""
+    best = None
+    best_score = None
+
+    for stream in streams or []:
+        info = stream.get("info", {})
+        name = str((info.get("name") or [""])[0]).lower()
+        stype = str((info.get("type") or [""])[0]).lower()
+        priority = 2 if any(k in f"{name} {stype}" for k in ("eeg", "emg", "exg", "biosignal")) else 0
+
+        try:
+            ts = np.asarray(stream.get("time_series", []))
+            if ts.ndim == 1:
+                ts = ts[:, np.newaxis]
+            if ts.ndim != 2 or ts.size == 0:
+                continue
+            numeric = ts.astype(np.float32)
+        except Exception:
+            continue
+
+        n_samples, n_channels = numeric.shape
+        score = (priority, n_channels, n_samples)
+        if best is None or score > best_score:
+            best = stream
+            best_score = score
+
+    return best
+
+
+def _load_simulation_from_xdf(path):
+    """Load EEG/EMG data from XDF file"""
+    try:
+        import pyxdf
+    except ImportError as exc:
+        raise RuntimeError("XDF support requires pyxdf. Install it with: pip install pyxdf") from exc
+
+    streams, _ = pyxdf.load_xdf(path)
+    data_stream = _select_xdf_data_stream(streams)
+    if data_stream is None:
+        raise ValueError("No numeric EEG/EMG stream found in XDF file")
+
+    info = data_stream.get("info", {})
+    channel_count_raw = (info.get("channel_count") or [0])[0]
+    try:
+        expected_channels = int(float(channel_count_raw))
+    except Exception:
+        expected_channels = 0
+
+    samples = np.asarray(data_stream.get("time_series", []), dtype=np.float32)
+    if samples.ndim == 1:
+        samples = samples[:, np.newaxis]
+    if samples.ndim != 2 or samples.size == 0:
+        raise ValueError("XDF stream does not contain 2D signal data")
+
+    if expected_channels and samples.shape[1] == expected_channels:
+        data = samples.T
+    elif expected_channels and samples.shape[0] == expected_channels:
+        data = samples
+    elif samples.shape[0] >= samples.shape[1]:
+        data = samples.T
+    else:
+        data = samples
+
+    sr_raw = (info.get("nominal_srate") or [0])[0]
+    try:
+        sampling_rate = float(sr_raw)
+    except Exception:
+        sampling_rate = 0.0
+    if sampling_rate <= 0:
+        ts = np.asarray(data_stream.get("time_stamps", []), dtype=np.float64)
+        if ts.size > 1:
+            diffs = np.diff(ts)
+            diffs = diffs[diffs > 0]
+            if diffs.size:
+                sampling_rate = float(1.0 / np.median(diffs))
+    if sampling_rate <= 0:
+        sampling_rate = float(fs)
+
+    n_channels = int(data.shape[0])
+    channel_names = _extract_xdf_channel_labels(data_stream, n_channels)
+    inferred_type = _infer_signal_type_from_names(
+        channel_names,
+        fallback='emg' if 'emg' in str((info.get("type") or [""])[0]).lower() else 'eeg'
+    )
+    stream_name = (info.get("name") or ["XDF stream"])[0]
+    return _build_simulation_payload(
+        data,
+        sampling_rate=sampling_rate,
+        signal_type=inferred_type,
+        description=f"Uploaded XDF stream: {stream_name}",
+        channel_names=channel_names,
+        source_format='xdf'
+    )
+
+
+def _load_simulation_from_fif(path):
+    """Load EEG/EMG data from FIF file"""
+    raw = mne.io.read_raw_fif(path, preload=True, verbose='ERROR')
+    picks = mne.pick_types(
+        raw.info,
+        eeg=True,
+        emg=True,
+        eog=True,
+        ecg=True,
+        misc=True,
+        stim=True,
+        exclude=[]
+    )
+    if picks is None or len(picks) == 0:
+        picks = np.arange(raw.info["nchan"])
+
+    data = raw.get_data(picks=picks).astype(np.float32, copy=False)
+    channel_names = [raw.ch_names[idx] for idx in picks]
+    channel_types = [raw.get_channel_types(picks=[idx])[0] for idx in picks]
+
+    emg_count = sum(1 for t in channel_types if t == 'emg')
+    eeg_count = sum(1 for t in channel_types if t == 'eeg')
+    signal_type = 'emg' if emg_count > eeg_count else 'eeg'
+
+    return _build_simulation_payload(
+        data,
+        sampling_rate=float(raw.info.get("sfreq", fs)),
+        signal_type=signal_type,
+        description="Uploaded FIF recording",
+        channel_names=channel_names,
+        source_format='fif'
+    )
+
+
 def read_eeg_data_file_simulation():
     """Read EEG data from uploaded file and replay it in real-time"""
     global collected_data, running, simulation_loaded_data, simulation_data_index, current_stream_sampling_rate
@@ -794,7 +1034,7 @@ def read_eeg_data_file_simulation():
         return
     
     metadata = simulation_loaded_data.get('metadata', {})
-    file_sampling_rate = metadata.get('sampling_rate', fs) or fs
+    file_sampling_rate = float(metadata.get('sampling_rate', fs) or fs)
     
     try:
         data_arrays = simulation_loaded_data['data']
@@ -803,7 +1043,7 @@ def read_eeg_data_file_simulation():
         if num_channels == 0:
             raise ValueError("Uploaded file does not contain channel data")
         
-        channel_lengths = [len(ch) for ch in data_arrays if isinstance(ch, list)]
+        channel_lengths = [len(ch) for ch in data_arrays]
         if not channel_lengths or min(channel_lengths) == 0:
             raise ValueError("Uploaded EEG file contains empty channels")
         
@@ -811,7 +1051,7 @@ def read_eeg_data_file_simulation():
         total_samples = min(channel_lengths)
         if total_samples != max(channel_lengths):
             logging.warning("Channel lengths differ. Truncating to %s samples for playback.", total_samples)
-        data_arrays = [channel[:total_samples] for channel in data_arrays]
+        data_arrays = [np.asarray(channel[:total_samples], dtype=np.float32) for channel in data_arrays]
         
         # Determine how much data to send per update (approx. 100 ms of data)
         samples_per_chunk = min(total_samples, compute_chunk_size(file_sampling_rate))
@@ -839,7 +1079,7 @@ def read_eeg_data_file_simulation():
                     chunk = channel_data[start_idx:end_idx]
                 else:
                     wrap = end_idx - total_samples
-                    chunk = channel_data[start_idx:] + channel_data[:wrap]
+                    chunk = np.concatenate((channel_data[start_idx:], channel_data[:wrap]))
                 chunk_data.append(chunk)
             
             simulation_data_index = (simulation_data_index + samples_per_chunk) % total_samples
@@ -1686,7 +1926,7 @@ Files follow the Brain Imaging Data Structure (BIDS) specification.
 
 @app.route('/upload-simulation-data', methods=['POST'])
 def upload_simulation_data():
-    """Upload EEG data file for simulation mode"""
+    """Upload EEG/EMG simulation data file (.json, .fif, .xdf)"""
     global simulation_loaded_data, simulation_data_index
     
     try:
@@ -1697,21 +1937,51 @@ def upload_simulation_data():
         
         if file.filename == '':
             return jsonify({"status": "error", "message": "No file selected"}), 400
-        
-        # Read and parse JSON data
-        file_content = file.read().decode('utf-8')
-        data = json.loads(file_content)
-        
-        # Validate data structure
-        if 'data' not in data or 'metadata' not in data:
-            return jsonify({"status": "error", "message": "Invalid file format. Expected JSON with 'data' and 'metadata' fields"}), 400
-        
-        simulation_loaded_data = data
+
+        filename = file.filename
+        lower_name = filename.lower()
+
+        if lower_name.endswith('.json'):
+            payload = _load_simulation_from_json(file)
+        elif lower_name.endswith('.fif'):
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.fif') as temp_file:
+                    temp_path = temp_file.name
+                    file.save(temp_path)
+                payload = _load_simulation_from_fif(temp_path)
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
+        elif lower_name.endswith('.xdf') or '.xdf.' in lower_name:
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.xdf') as temp_file:
+                    temp_path = temp_file.name
+                    file.save(temp_path)
+                payload = _load_simulation_from_xdf(temp_path)
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
+        else:
+            ext = ''.join(Path(lower_name).suffixes) or Path(lower_name).suffix or lower_name
+            return jsonify({
+                "status": "error",
+                "message": f"Unsupported file type: {ext}. Supported: .json, .fif, .xdf"
+            }), 400
+
+        simulation_loaded_data = payload
         simulation_data_index = 0
         
-        metadata = data['metadata']
+        metadata = payload['metadata']
         
-        logging.info(f"Loaded simulation data: {metadata['num_channels']} channels, {metadata['num_samples']} samples")
+        logging.info(
+            "Loaded simulation data (%s): %s channels, %s samples @ %s Hz",
+            metadata.get("source_format", "unknown"),
+            metadata.get("num_channels"),
+            metadata.get("num_samples"),
+            metadata.get("sampling_rate")
+        )
         
         return jsonify({
             "status": "success",
@@ -1719,8 +1989,8 @@ def upload_simulation_data():
             "metadata": metadata
         })
         
-    except json.JSONDecodeError:
-        return jsonify({"status": "error", "message": "Invalid JSON format"}), 400
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         logging.error(f"Error uploading simulation data: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
