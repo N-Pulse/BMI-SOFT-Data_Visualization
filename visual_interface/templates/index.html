@@ -118,8 +118,8 @@
                     </div>
                     <div id="fileUploadSection" style="display: none; margin-top: 20px;">
                         <h3>Upload EEG/EMG Data File</h3>
-                        <p class="file-description">Upload a JSON file containing EEG or EMG data to replay in simulation mode</p>
-                        <input type="file" id="eegFileInput" accept=".json" onchange="uploadEEGFile()">
+                        <p class="file-description">Upload a JSON, FIF or XDF file containing EEG or EMG data to replay in simulation mode</p>
+                        <input type="file" id="eegFileInput" accept=".json,.fif,.xdf,.xdf.part" onchange="uploadEEGFile()">
                         <div id="fileStatus" class="file-status"></div>
                     </div>
                 </div>
