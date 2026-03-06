@@ -36,6 +36,12 @@ python app.py
 
 Keep the terminal open while testing—this is where simulation/hardware logs appear and the process must stay alive while the browser displays data.
 
+#### If while restarting the code you get a message "Port 5001 is in use by another program", do this:
+```python
+kill 25462
+python3 app.py
+```
+
 ## Using the interface
 
 1. Open your browser to `http://127.0.0.1:5001/` (or `http://10.181.14.171:5001` - it's more sharp-cut).
