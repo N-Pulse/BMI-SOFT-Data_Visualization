@@ -22,7 +22,6 @@ let featureTimeChart = null;
 let featureHistory = [];
 let isSimulationMode = false;
 let currentSignalType = 'eeg';
-let currentHardwareSource = 'pieeg';
 let chartMode = 'overlap';
 let isRecording = false;
 let isRecordingPaused = false;
@@ -58,7 +57,6 @@ document.addEventListener('DOMContentLoaded', () => {
   initializeFeatureCharts();
   updateSignalUI();
   updateSettings();
-  loadHardwareSource();
   loadMetadata();
   renderMarkers();
   renderSessionSummary();
@@ -414,43 +412,6 @@ function setSignalType(type) {
     .catch(error => {
       console.error('[client] Error changing signal type:', error);
       alert(error.message || 'Failed to change signal type');
-    });
-}
-
-function loadHardwareSource() {
-  const select = document.getElementById('hardwareSourceSelect');
-  if (!select) return;
-  fetch('/hardware-source')
-    .then(parseJsonResponse)
-    .then(data => {
-      currentHardwareSource = data.hardware_source || 'pieeg';
-      select.value = currentHardwareSource;
-    })
-    .catch(error => {
-      console.error('[client] Error loading hardware source:', error);
-    });
-}
-
-function setHardwareSource(source) {
-  const select = document.getElementById('hardwareSourceSelect');
-  fetch('/set-hardware-source', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ hardware_source: source })
-  })
-    .then(parseJsonResponse)
-    .then(data => {
-      currentHardwareSource = data.hardware_source || source;
-      if (select) {
-        select.value = currentHardwareSource;
-      }
-    })
-    .catch(error => {
-      console.error('[client] Error setting hardware source:', error);
-      if (select) {
-        select.value = currentHardwareSource;
-      }
-      alert(error.message || 'Failed to set hardware source');
     });
 }
 
@@ -1192,11 +1153,6 @@ function saveMetadata(silent = false) {
 // Socket.IO event handlers
 socket.on('connect', () => console.log('[client] Socket.IO connected'));
 socket.on('disconnect', () => console.log('[client] Socket.IO disconnected'));
-socket.on('error', payload => {
-  const message = payload && payload.message ? payload.message : 'Backend error';
-  console.error('[client] Backend error:', payload);
-  alert(message);
-});
 
 socket.on('analysis_stopped', () => {
   document.getElementById('startBtn').disabled = false;
