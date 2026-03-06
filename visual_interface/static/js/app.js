@@ -439,8 +439,15 @@ function uploadEEGFile() {
   }
 
   const file = fileInput.files[0];
-  if (!file.name.endsWith('.json')) {
-    fileStatus.textContent = 'Error: Please upload a JSON file';
+  const lowerName = file.name.toLowerCase();
+  const isSupported =
+    lowerName.endsWith('.json') ||
+    lowerName.endsWith('.fif') ||
+    lowerName.endsWith('.xdf') ||
+    lowerName.includes('.xdf.');
+
+  if (!isSupported) {
+    fileStatus.textContent = 'Error: Supported formats are .json, .fif, .xdf';
     fileStatus.style.color = '#f44336';
     return;
   }
