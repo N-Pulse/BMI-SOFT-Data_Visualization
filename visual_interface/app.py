@@ -35,11 +35,21 @@ socketio = SocketIO(
 params = BrainFlowInputParams()
 params.serial_port = '/dev/spidev0.0'
 
-# Initialize the variables
-enabled_channels = 8  # Default to 8 channels enabled
-ref_enabled = True  # Default to REF enabled
-biasout_enabled = True  # Default to BIASOUT enabled
-fs = 250  # Sampling frequency
+# ── Acquisition settings ────────────────────────────────────────────────────
+# These are the runtime defaults.  Most can be changed live via /update-settings
+# without restarting the stream.
+#
+# enabled_channels — how many channels to read and stream.
+#   • PiEEG board          → up to 8
+#   • DSI-24 headset       → up to 24
+#   • Standard 64-ch cap   → up to 64
+#   The default is 8 (matches the PiEEG hardware we currently have).
+MAX_CHANNELS     = 64  # hard upper limit for EEG channels (/update-settings)
+MAX_EMG_CHANNELS = 16  # hard upper limit for EMG channels (N-Pulse bracelet)
+enabled_channels = 8
+ref_enabled = True           # whether the REF electrode is active (PiEEG)
+biasout_enabled = True       # whether the BIASOUT/DRL electrode is active (PiEEG)
+fs = 250                     # sampling frequency in Hz
 bandpass_enabled = False
 baseline_correction_enabled = False
 smoothing_enabled = False
@@ -47,15 +57,18 @@ downsample_factor = 1
 current_stream_sampling_rate = fs
 features_enabled = False
 
-lowcut = 3.0
-highcut = 45.0
-order = 2
+lowcut = 3.0    # bandpass low-cut frequency (Hz)
+highcut = 45.0  # bandpass high-cut frequency (Hz)
+order = 2       # Butterworth filter order
 
-# Set up 8 ch for read data
-collected_data = [[] for _ in range(8)]
+# Rolling data buffers — resized dynamically in update_collected_buffer()
+# whenever the channel count changes.  Initialised for 8 channels at startup.
+collected_data = [[] for _ in range(enabled_channels)]
 collected_data_lock = threading.Lock()
 
-calibration_values = [0] * 8
+# Per-channel baseline offsets computed during the calibration step.
+# Subtracted from each sample when baseline_correction_enabled is True.
+calibration_values = [0] * MAX_CHANNELS
 
 spi = None
 chip = None
@@ -88,6 +101,44 @@ event_markers = []
 recording_lock = threading.Lock()
 event_lock = threading.Lock()
 metadata_cache = {}
+
+# ---------------------------------------------------------------------------
+# Dual-stream mode — run EEG and EMG acquisition simultaneously so both
+# signals can be visualised side-by-side in the same browser session.
+# When dual_stream_mode is True:
+#   • The primary acquisition thread streams EEG (or whatever the user picked)
+#     and emits 'eeg_data' Socket.IO events as usual.
+#   • A secondary background thread runs an independent EMG generator and
+#     emits 'emg_data' Socket.IO events on a separate channel.
+#   • The frontend renders two independent chart panels, one per signal.
+# ---------------------------------------------------------------------------
+dual_stream_mode = False                  # toggled by /toggle-dual-mode
+emg_enabled_channels = 8                  # number of EMG channels shown in the second panel (max MAX_EMG_CHANNELS)
+
+# ── File-replay playback controls ───────────────────────────────────────────
+# These variables let the user pause and seek within a loaded recording file,
+# similar to a video player scrubber.  They are only relevant when
+# simulation_loaded_data is set and the acquisition thread is running
+# read_eeg_data_file_simulation().
+#
+# stream_paused      — when True the replay loop sleeps instead of emitting
+#                      samples, effectively freezing the waveform.
+# seek_requested     — when True the replay loop jumps to seek_target_sample
+#                      on its next iteration instead of advancing normally.
+# seek_target_sample — sample index to jump to (set by /seek-stream).
+# replay_total_samples — total sample count of the currently loaded file;
+#                        sent to the frontend so it can size the scrubber.
+stream_paused          = False
+seek_requested         = False
+seek_target_sample     = 0
+replay_total_samples   = 0       # set when a file is loaded / replay starts
+replay_sampling_rate   = 0.0     # file's own sampling rate (needed to convert samples ↔ seconds)
+playback_lock          = threading.Lock()  # guards the three seek/pause variables
+
+# Separate rolling buffer for EMG data in dual-stream mode.
+# The primary 'collected_data' buffer continues to hold EEG data.
+emg_collected_data = [[] for _ in range(8)]
+emg_collected_data_lock = threading.Lock()
 
 filter_state = {
     "bandpass": None,
@@ -179,12 +230,31 @@ def update_filter_coefficients(sampling_rate):
         except Exception as e:
             logging.error(f"Failed to compute notch filters: {e}")
 
-def apply_filters(data_transposed, sampling_rate):
-    """Apply bandpass and notch filters when enabled"""
+def apply_filters(data_transposed, sampling_rate, signal_type=None):
+    """Apply bandpass and notch filters when enabled.
+
+    Parameters
+    ----------
+    data_transposed : np.ndarray, shape (channels, samples)
+        Raw chunk of biosignal data.
+    sampling_rate : float
+        Sampling frequency in Hz (needed by the filter).
+    signal_type : str or None
+        'eeg', 'emg', or 'motion'.  Falls back to the global
+        current_signal_type when None.  Used to decide whether
+        50/60 Hz power-line notch filters are applied — we only
+        apply them to EEG because EMG has a much wider bandwidth
+        and the notch would remove real muscle-activity content.
+    """
+    # Resolve which signal type is being processed
+    sig = signal_type if signal_type is not None else current_signal_type
+
     with filter_lock:
         bp_coeffs = filter_state.get("bandpass")
         notch_50 = filter_state.get("notch_50")
         notch_60 = filter_state.get("notch_60")
+
+    # --- Bandpass filter (optional, user-controlled) ---
     if bandpass_enabled and bp_coeffs:
         b, a = bp_coeffs
         try:
@@ -195,7 +265,11 @@ def apply_filters(data_transposed, sampling_rate):
                 logging.debug("Skipping bandpass: chunk too short for filtfilt")
         except Exception as e:
             logging.error(f"Bandpass filtering failed: {e}")
-    if current_signal_type == 'eeg':
+
+    # --- 50 Hz and 60 Hz notch filters (EEG only) ---
+    # Power-line interference is a major EEG artefact but notching EMG
+    # signals would remove muscle energy in those frequency bands.
+    if sig == 'eeg':
         for notch in (notch_50, notch_60):
             if notch:
                 b, a = notch
@@ -288,31 +362,52 @@ def compute_emg_features(chunk):
         mav.append(float(np.mean(np.abs(ch))))
     return rms, mav
 
-def emit_features(chunk, sampling_rate, acquisition_ts):
-    """Emit EEG/EMG features when enabled"""
+def emit_features(chunk, sampling_rate, acquisition_ts, signal_type=None):
+    """Compute and emit per-signal-type features to the frontend.
+
+    For EEG  → band power (delta / theta / alpha / beta) via Welch PSD.
+    For EMG  → RMS and MAV (Mean Absolute Value) per channel.
+    For Motion → no features (skipped to reduce Socket.IO traffic).
+
+    Parameters
+    ----------
+    signal_type : str or None
+        Override the global current_signal_type.  Needed in dual-stream
+        mode so each thread knows which signal it is processing.
+    """
     if not features_enabled:
         return
+
+    # Resolve signal type (supports dual-stream where both threads run at once)
+    sig = signal_type if signal_type is not None else current_signal_type
+
     server_ts = time.time()
     payload = {
         "timestamp": server_ts,
         "sampling_rate": sampling_rate,
-        "signal_type": current_signal_type
+        "signal_type": sig
     }
-    if current_signal_type == 'motion':
-        # Motion features not implemented; skip to reduce noise
+
+    if sig == 'motion':
+        # Motion features are not yet implemented — placeholder for future IMU metrics
         payload["features"] = {}
-    elif current_signal_type == 'eeg':
+    elif sig == 'eeg':
+        # EEG: compute power in each classical frequency band
         bands = {
-            "delta": (1, 4),
-            "theta": (4, 8),
-            "alpha": (8, 13),
-            "beta": (13, 30)
+            "delta": (1, 4),    # slow waves, deep sleep
+            "theta": (4, 8),    # drowsiness, memory
+            "alpha": (8, 13),   # relaxation, closed eyes
+            "beta": (13, 30)    # active thinking, motor activity
         }
         bandpower = compute_bandpower(chunk, sampling_rate, bands)
         payload["features"] = {"bands": bandpower}
     else:
+        # EMG: amplitude-based features — useful for detecting muscle contractions
+        # RMS  = root-mean-square → reflects signal power / muscle force
+        # MAV  = mean absolute value → simpler alternative to RMS, faster to compute
         rms, mav = compute_emg_features(chunk)
         payload["features"] = {"rms": rms, "mav": mav}
+
     payload["acquisition_timestamp"] = acquisition_ts
     payload["latency_ms"] = (server_ts - acquisition_ts) * 1000 if acquisition_ts else None
     socketio.emit('features', payload)
@@ -328,38 +423,87 @@ def apply_baseline_correction(data_transposed):
         logging.error(f"Baseline correction failed: {e}")
     return data_transposed
 
-def process_and_emit_chunk(data_transposed, sampling_rate, acquisition_ts=None):
-    """Common pipeline for all acquisition paths"""
+def process_and_emit_chunk(data_transposed, sampling_rate, acquisition_ts=None, signal_type=None):
+    """Central processing pipeline shared by every acquisition path.
+
+    This function is the single place where raw samples go through the full
+    signal-processing chain before being pushed to the browser.  All
+    acquisition threads (hardware, simulation, file-replay, dual-stream EMG)
+    call this function with their raw data.
+
+    Pipeline stages
+    ---------------
+    1. apply_filters      – bandpass + notch (EEG only)
+    2. apply_baseline_correction – subtract per-channel DC offset
+    3. apply_smoothing    – optional moving-average
+    4. apply_downsampling – optional decimation to reduce frontend load
+
+    After processing:
+    • Data is pushed to the rolling export buffer (and recording buffer if active).
+    • A Socket.IO event is emitted to the browser:
+        'eeg_data'  → for EEG / Motion / single-stream EMG
+        'emg_data'  → for the secondary EMG stream in dual-stream mode
+    • QC metrics and signal features are computed and emitted separately.
+
+    Parameters
+    ----------
+    data_transposed : np.ndarray, shape (channels, samples)
+    sampling_rate   : float — Hz of the incoming data
+    acquisition_ts  : float — Unix timestamp when the hardware captured the chunk
+    signal_type     : str or None — 'eeg', 'emg', 'motion'.  Overrides the
+                      global current_signal_type.  Required in dual-stream
+                      mode so each thread identifies its own signal correctly.
+    """
     if data_transposed is None or data_transposed.size == 0:
         return
+
+    # Resolve the signal type for this chunk
+    sig = signal_type if signal_type is not None else current_signal_type
     acquisition_ts = acquisition_ts or time.time()
+
     try:
-        processed = apply_filters(data_transposed, sampling_rate)
+        # --- Signal processing chain ---
+        processed = apply_filters(data_transposed, sampling_rate, signal_type=sig)
         processed = apply_baseline_correction(processed)
         processed = apply_smoothing(processed)
         processed, effective_rate = apply_downsampling(processed, sampling_rate)
 
         data_for_frontend = processed.tolist()
-        update_collected_buffer(data_for_frontend, effective_rate)
-        buffer_recording_data(data_for_frontend, effective_rate)
 
+        # --- Buffer routing ---
+        # In dual-stream mode the secondary EMG thread writes to a dedicated
+        # emg_collected_data buffer so it doesn't overwrite the EEG data.
+        # The recording buffer (for BIDS export) only captures the primary stream.
+        if sig == 'emg' and dual_stream_mode:
+            update_emg_collected_buffer(data_for_frontend, effective_rate)
+        else:
+            update_collected_buffer(data_for_frontend, effective_rate)
+            buffer_recording_data(data_for_frontend, effective_rate)
+
+        # --- Emit to frontend ---
+        # 'emg_data' drives the second chart panel; 'eeg_data' drives the first.
         server_ts = time.time()
-        socketio.emit('eeg_data', {
+        event_name = 'emg_data' if (sig == 'emg' and dual_stream_mode) else 'eeg_data'
+        socketio.emit(event_name, {
             'channels': data_for_frontend,
             'sampling_rate': effective_rate,
-            'signal_type': current_signal_type,
+            'signal_type': sig,
             'timestamp': server_ts,
             'acquisition_timestamp': acquisition_ts,
             'latency_ms': (server_ts - acquisition_ts) * 1000 if acquisition_ts else None,
             'downsample_factor': downsample_factor
         })
+
+        # --- Quality control and feature extraction ---
         compute_qc_metrics(processed, effective_rate, acquisition_ts, server_ts)
-        emit_features(processed, effective_rate, acquisition_ts)
+        emit_features(processed, effective_rate, acquisition_ts, signal_type=sig)
+
         with chunk_counter_lock:
             global chunk_counter
             chunk_counter += 1
             if chunk_counter % 20 == 0:
-                logging.info(f"Streamed {chunk_counter} chunks @ {effective_rate} Hz (signal={current_signal_type})")
+                logging.info(f"Streamed {chunk_counter} chunks @ {effective_rate} Hz (signal={sig})")
+
     except Exception as e:
         logging.error(f"Chunk processing error: {e}")
         raise
@@ -404,6 +548,28 @@ def update_collected_buffer(data_for_frontend, sampling_rate):
             collected_data[idx].extend(channel_data)
             if len(collected_data[idx]) > max_samples:
                 collected_data[idx] = collected_data[idx][-max_samples:]
+
+def update_emg_collected_buffer(data_for_frontend, sampling_rate):
+    """Keep a rolling 5-minute buffer of EMG data in dual-stream mode.
+
+    This is the EMG equivalent of update_collected_buffer.  Having separate
+    buffers means EEG and EMG data never overwrite each other, and both can
+    be exported independently after a session.
+    """
+    global emg_collected_data
+    if not data_for_frontend:
+        return
+    with emg_collected_data_lock:
+        # Resize buffer if the channel count changed (e.g. user adjusted EMG channels)
+        if not emg_collected_data or len(emg_collected_data) != len(data_for_frontend):
+            emg_collected_data = [[] for _ in range(len(data_for_frontend))]
+        max_samples = int(sampling_rate * max_buffer_seconds)
+        for idx, channel_data in enumerate(data_for_frontend):
+            emg_collected_data[idx].extend(channel_data)
+            # Drop oldest samples once the rolling window is full
+            if len(emg_collected_data[idx]) > max_samples:
+                emg_collected_data[idx] = emg_collected_data[idx][-max_samples:]
+
 
 def reset_recording_state():
     """Reset recording-related state"""
@@ -1272,88 +1438,176 @@ def _score_signal_filename(filename):
 
 
 def read_eeg_data_file_simulation():
-    """Read EEG data from uploaded file and replay it in real-time"""
-    global collected_data, running, simulation_loaded_data, simulation_data_index, current_stream_sampling_rate
-    
+    """Replay a loaded recording file in real time with pause and seek support.
+
+    Playback controls
+    -----------------
+    • stream_paused = True  → the loop idles (10 ms sleep) without emitting
+      samples. The waveform freezes on screen. Resume by setting it False.
+
+    • seek_requested = True → on the next iteration the loop jumps
+      simulation_data_index to seek_target_sample before emitting the next
+      chunk. This is how the frontend scrubber seeks to a time position.
+
+    Progress events
+    ---------------
+    Every chunk the loop emits a 'playback_progress' Socket.IO event:
+        { current_sample, total_samples, current_time_sec, total_time_sec }
+    The frontend uses this to advance the scrubber thumb in real time.
+    """
+    global collected_data, running, simulation_loaded_data, simulation_data_index
+    global current_stream_sampling_rate, replay_total_samples, replay_sampling_rate
+    global stream_paused, seek_requested, seek_target_sample
+
     if not simulation_loaded_data:
         logging.error("No simulation data loaded")
         socketio.emit('error', {'message': "Please upload an EEG data file first"})
         return
-    
+
     metadata = simulation_loaded_data.get('metadata', {})
     file_sampling_rate = float(metadata.get('sampling_rate', fs) or fs)
-    
+
     try:
         data_arrays = simulation_loaded_data['data']
         num_channels = len(data_arrays)
-        
+
         if num_channels == 0:
             raise ValueError("Uploaded file does not contain channel data")
-        
+
         channel_lengths = [len(ch) for ch in data_arrays]
         if not channel_lengths or min(channel_lengths) == 0:
             raise ValueError("Uploaded EEG file contains empty channels")
 
-        # Stream only channels currently visible in the UI to reduce CPU/socket load
+        # Limit to the number of channels the UI is configured to show
         target_channels = 3 if current_signal_type == 'motion' else max(1, int(enabled_channels))
         if num_channels > target_channels:
             logging.info(
-                "Uploaded file has %s channels; streaming first %s channels for real-time view",
-                num_channels,
-                target_channels
+                "Uploaded file has %s channels; streaming first %s for real-time view",
+                num_channels, target_channels
             )
             data_arrays = data_arrays[:target_channels]
             num_channels = target_channels
             channel_lengths = channel_lengths[:target_channels]
-        
-        # Ensure all channels have the same number of samples by truncating to the shortest
+
+        # Align all channels to the shortest length so indexing is always valid
         total_samples = min(channel_lengths)
         if total_samples != max(channel_lengths):
-            logging.warning("Channel lengths differ. Truncating to %s samples for playback.", total_samples)
-        data_arrays = [np.asarray(channel[:total_samples], dtype=np.float32) for channel in data_arrays]
-        
-        # Determine how much data to send per update (approx. 100 ms of data)
+            logging.warning("Channel lengths differ. Truncating to %s samples.", total_samples)
+        data_arrays = [np.asarray(ch[:total_samples], dtype=np.float32) for ch in data_arrays]
+
+        # ~100 ms of data per chunk — small enough for a responsive UI,
+        # large enough to keep Socket.IO overhead low
         samples_per_chunk = min(total_samples, compute_chunk_size(file_sampling_rate))
-        
-        simulation_data_index = 0  # Restart from the beginning each time analysis starts
+
+        # Expose file length so the frontend can size the scrubber correctly.
+        # Keep replay_sampling_rate for seconds ↔ sample conversion in /seek-stream.
+        replay_total_samples = total_samples
+        replay_sampling_rate = file_sampling_rate
+
+        # Always start from the beginning when replay is (re)started
+        with playback_lock:
+            stream_paused      = False
+            seek_requested     = False
+            seek_target_sample = 0
+        simulation_data_index = 0
+
         with collected_data_lock:
             collected_data = [[] for _ in range(num_channels)]
-        
+
         logging.info(
-            "Starting FILE SIMULATION mode - replaying uploaded EEG data (%s channels, %s samples/channel)",
-            num_channels,
-            total_samples
+            "FILE REPLAY started: %s ch, %s samples @ %.1f Hz (%.1f s)",
+            num_channels, total_samples, file_sampling_rate,
+            total_samples / file_sampling_rate
         )
-        
+
         update_filter_coefficients(file_sampling_rate)
-        current_stream_sampling_rate = file_sampling_rate / downsample_factor if downsample_factor > 0 else file_sampling_rate
-        
+        current_stream_sampling_rate = (
+            file_sampling_rate / downsample_factor if downsample_factor > 0 else file_sampling_rate
+        )
+
+        # Notify the frontend of the file length so it can render the scrubber
+        socketio.emit('playback_info', {
+            'total_samples':  total_samples,
+            'total_time_sec': total_samples / file_sampling_rate,
+            'sampling_rate':  file_sampling_rate
+        })
+
+        # ── Main replay loop ─────────────────────────────────────────────────
         while running:
+
+            # ── Pause handling ───────────────────────────────────────────────
+            # While paused we busy-wait in short sleeps so we can react quickly
+            # to a resume or a seek without blocking for a full chunk duration.
+            # We still honour seek requests here so the user can scrub to a new
+            # position while frozen and resume from there when they click Live.
+            with playback_lock:
+                paused = stream_paused
+                if paused and seek_requested:
+                    simulation_data_index = max(0, min(seek_target_sample, total_samples - 1))
+                    seek_requested = False
+                    logging.info("Seeked (while paused) to sample %s (%.2f s)",
+                                 simulation_data_index,
+                                 simulation_data_index / file_sampling_rate)
+            if paused:
+                time.sleep(0.01)
+                continue
+
+            # ── Seek handling ────────────────────────────────────────────────
+            # The /seek-stream endpoint writes seek_target_sample and sets the
+            # flag.  We honour it at the top of the loop to avoid emitting a
+            # partial chunk from the old position first.
+            with playback_lock:
+                if seek_requested:
+                    simulation_data_index = max(0, min(seek_target_sample, total_samples - 1))
+                    seek_requested = False
+                    logging.info("Seeked to sample %s (%.2f s)",
+                                 simulation_data_index,
+                                 simulation_data_index / file_sampling_rate)
+
+            # ── Read and emit one chunk ──────────────────────────────────────
             start_idx = simulation_data_index
-            end_idx = start_idx + samples_per_chunk
+            end_idx   = start_idx + samples_per_chunk
             chunk_data = []
-            
+
             for channel_data in data_arrays:
                 if end_idx <= total_samples:
                     chunk = channel_data[start_idx:end_idx]
                 else:
-                    wrap = end_idx - total_samples
+                    # Wrap around to the beginning when we reach the end
+                    wrap  = end_idx - total_samples
                     chunk = np.concatenate((channel_data[start_idx:], channel_data[:wrap]))
                 chunk_data.append(chunk)
-            
+
             simulation_data_index = (simulation_data_index + samples_per_chunk) % total_samples
-            
+
             data_transposed = np.array(chunk_data)
-            acquisition_ts = time.time()
+            acquisition_ts  = time.time()
             process_and_emit_chunk(data_transposed, file_sampling_rate, acquisition_ts=acquisition_ts)
-            
-            # Sleep roughly the amount of real time that chunk represents
+
+            # ── Progress event ───────────────────────────────────────────────
+            # Sent every chunk so the frontend scrubber thumb stays in sync.
+            socketio.emit('playback_progress', {
+                'current_sample':   simulation_data_index,
+                'total_samples':    total_samples,
+                'current_time_sec': simulation_data_index / file_sampling_rate,
+                'total_time_sec':   total_samples / file_sampling_rate
+            })
+
+            # Sleep for the real-time duration of this chunk
             time.sleep(samples_per_chunk / file_sampling_rate)
-            
+
     except Exception as e:
         logging.error(f"File simulation error: {e}")
         running = False
         socketio.emit('error', {'message': f"File simulation error: {str(e)}"})
+    finally:
+        # Emit a final progress event so the scrubber shows the correct end state
+        socketio.emit('playback_progress', {
+            'current_sample':   simulation_data_index,
+            'total_samples':    replay_total_samples,
+            'current_time_sec': simulation_data_index / max(replay_sampling_rate, 1),
+            'total_time_sec':   replay_total_samples / max(replay_sampling_rate, 1)
+        })
 
 def read_eeg_data_simulation():
     """Read synthetic EEG data for testing without hardware"""
@@ -1416,6 +1670,62 @@ def read_motion_data_simulation():
         logging.error(f"Motion simulation error: {e}")
         running = False
         socketio.emit('error', {'message': f"Motion simulation error: {str(e)}"})
+
+def read_emg_data_dual_simulation():
+    """Secondary acquisition thread for dual-stream (EEG + EMG) mode.
+
+    This function runs as an independent background task alongside the primary
+    EEG acquisition thread.  It generates synthetic multi-channel EMG data and
+    pushes it to the frontend via the 'emg_data' Socket.IO event so the second
+    chart panel can display it in real time.
+
+    How it fits into the dual-stream architecture
+    ---------------------------------------------
+    • Primary thread  → read_eeg_data_simulation (or hardware variant)
+                        emits 'eeg_data' → drives the top EEG chart panel
+    • This thread     → read_emg_data_dual_simulation
+                        emits 'emg_data' → drives the bottom EMG chart panel
+
+    The number of EMG channels is controlled by the global emg_enabled_channels
+    (configurable from the UI via /toggle-dual-mode).
+
+    When real EMG hardware (e.g. the N-Pulse bracelet) is available, this
+    function should be replaced by a hardware-reading equivalent that connects
+    to the bracelet's communication interface (BLE / Serial / LSL) and feeds
+    real samples through process_and_emit_chunk with signal_type='emg'.
+    """
+    global running
+    logging.info(
+        "Starting DUAL-STREAM EMG simulation (%s channels @ %s Hz)",
+        emg_enabled_channels, fs
+    )
+    samples_per_chunk = compute_chunk_size(fs)
+
+    try:
+        # Keep running as long as the primary analysis is active AND dual mode is on.
+        # If the user stops the stream or disables dual mode, this thread exits cleanly.
+        while running and dual_stream_mode:
+            data_transposed = generate_synthetic_emg_data(
+                num_samples=samples_per_chunk,
+                num_channels=emg_enabled_channels
+            )
+            acquisition_ts = time.time()
+            # signal_type='emg' tells process_and_emit_chunk to:
+            #   • skip the EEG notch filters
+            #   • emit on the 'emg_data' Socket.IO channel
+            #   • write to the emg_collected_data buffer (not the EEG buffer)
+            process_and_emit_chunk(
+                data_transposed, fs,
+                acquisition_ts=acquisition_ts,
+                signal_type='emg'
+            )
+            # Sleep for exactly one chunk duration to maintain the correct sample rate
+            time.sleep(samples_per_chunk / fs)
+
+    except Exception as e:
+        logging.error(f"Dual-stream EMG simulation error: {e}")
+        socketio.emit('error', {'message': f"Dual EMG simulation error: {str(e)}"})
+
 
 def read_eeg_data_brainflow():
     """Read EEG data from BrainFlow and emit to frontend"""
@@ -1893,6 +2203,39 @@ def set_hardware_source():
     return jsonify({"status": "ok", "hardware_source": hardware_source})
 
 
+@app.route('/toggle-dual-mode', methods=['POST'])
+def toggle_dual_mode():
+    """Enable or disable synchronized EEG + EMG dual-stream mode.
+
+    Must be called while analysis is stopped.  The frontend sends:
+        { "dual_mode": true/false, "emg_channels": 8 }
+
+    When dual_mode is True, the next /start-analysis call will launch a second
+    background thread that streams EMG data in parallel with the EEG thread.
+    """
+    global dual_stream_mode, emg_enabled_channels
+    if running:
+        return jsonify({
+            "status": "error",
+            "message": "Stop the stream before changing dual-stream mode"
+        }), 409
+
+    payload = request.get_json(silent=True) or {}
+    dual_stream_mode = bool(payload.get('dual_mode', False))
+    emg_enabled_channels = max(1, int(payload.get('emg_channels', emg_enabled_channels)))
+
+    logging.info(
+        "Dual-stream mode %s (emg_channels=%s)",
+        'ENABLED' if dual_stream_mode else 'DISABLED',
+        emg_enabled_channels
+    )
+    return jsonify({
+        "status": "ok",
+        "dual_stream_mode": dual_stream_mode,
+        "emg_enabled_channels": emg_enabled_channels
+    })
+
+
 @app.route('/start-analysis', methods=['POST'])
 def start_analysis():
     """Start EEG/EMG analysis"""
@@ -1952,23 +2295,127 @@ def start_analysis():
     mode_label = "SIMULATION" if simulation_mode else "HARDWARE"
     logging.info(f"Starting analysis ({mode_label}, signal={current_signal_type.upper()}, fs={fs}Hz)")
     try:
+        # Launch the primary acquisition thread (EEG / Motion / single EMG stream)
         socketio.start_background_task(target)
+
+        # In dual-stream mode, launch a second independent EMG thread so both
+        # EEG and EMG data flow to the browser at the same time.
+        # Currently only available in simulation mode; hardware support will be
+        # added once the N-Pulse EMG bracelet communication protocol is confirmed.
+        if dual_stream_mode and simulation_mode:
+            with emg_collected_data_lock:
+                # Reset the EMG buffer to match the new number of channels
+                global emg_collected_data
+                emg_collected_data = [[] for _ in range(emg_enabled_channels)]
+            socketio.start_background_task(read_emg_data_dual_simulation)
+            logging.info(
+                "Dual-stream EMG thread started (%s channels)", emg_enabled_channels
+            )
+
     except Exception as exc:
         running = False
         logging.error(f"Failed to start analysis task: {exc}")
         return jsonify({"status": "error", "message": f"Failed to start analysis: {str(exc)}"}), 500
 
-    return jsonify({"status": "Analysis started"})
+    return jsonify({
+        "status": "Analysis started",
+        "dual_stream_mode": dual_stream_mode
+    })
+
+@app.route('/pause-stream', methods=['POST'])
+def pause_stream():
+    """Pause or resume file-replay playback without stopping the stream.
+
+    This is separate from the recording pause (/pause-recording).
+    Pausing the stream freezes the waveform display; the acquisition thread
+    keeps running but idles instead of emitting samples.
+
+    Body (JSON): { "paused": true | false }
+    If 'paused' is omitted the state is toggled.
+    """
+    global stream_paused
+    if not running:
+        return jsonify({"status": "error", "message": "Stream is not running"}), 400
+
+    payload = request.get_json(silent=True) or {}
+    with playback_lock:
+        if 'paused' in payload:
+            stream_paused = bool(payload['paused'])
+        else:
+            stream_paused = not stream_paused
+        state = stream_paused
+
+    logging.info("Stream %s", "PAUSED" if state else "RESUMED")
+    return jsonify({"status": "ok", "paused": state})
+
+
+@app.route('/seek-stream', methods=['POST'])
+def seek_stream():
+    """Jump playback to a specific position in the loaded file.
+
+    The frontend sends either a sample index or a time in seconds;
+    the server converts and clamps to the valid range.
+
+    Body (JSON, one of):
+        { "sample": 12500 }          — seek to sample 12500
+        { "time_sec": 50.0 }         — seek to 50 seconds into the file
+        { "fraction": 0.42 }         — seek to 42 % of the total duration
+
+    Returns: { current_sample, total_samples, current_time_sec, total_time_sec }
+    """
+    global seek_requested, seek_target_sample
+
+    if not running:
+        return jsonify({"status": "error", "message": "Stream is not running"}), 400
+
+    total = replay_total_samples
+    rate  = max(replay_sampling_rate, 1.0)  # avoid div-by-zero before a file is loaded
+
+    if total == 0:
+        return jsonify({"status": "error", "message": "No file loaded for replay"}), 400
+
+    payload = request.get_json(silent=True) or {}
+
+    # Resolve the requested position from whichever field was sent
+    if 'sample' in payload:
+        target = int(payload['sample'])
+    elif 'time_sec' in payload:
+        target = int(float(payload['time_sec']) * rate)
+    elif 'fraction' in payload:
+        target = int(float(payload['fraction']) * total)
+    else:
+        return jsonify({"status": "error", "message": "Provide 'sample', 'time_sec', or 'fraction'"}), 400
+
+    # Clamp to [0, total_samples - 1]
+    target = max(0, min(target, total - 1))
+
+    with playback_lock:
+        seek_target_sample = target
+        seek_requested     = True
+
+    logging.info("Seek requested → sample %s (%.2f s)", target, target / rate)
+    return jsonify({
+        "status":           "ok",
+        "current_sample":   target,
+        "total_samples":    total,
+        "current_time_sec": target / rate,
+        "total_time_sec":   total / rate
+    })
+
 
 @app.route('/stop-analysis', methods=['POST'])
 def stop_analysis():
-    """Stop EEG analysis"""
-    global running
+    """Stop the acquisition stream and reset playback state."""
+    global running, stream_paused, seek_requested
     running = False
-    time.sleep(0.3)  # brief pause to let threads exit
+    # Reset playback controls so next Start always begins from the top
+    with playback_lock:
+        stream_paused  = False
+        seek_requested = False
+    time.sleep(0.3)  # brief pause to let threads exit cleanly
     if hardware_source == "pieeg":
         cleanup_spi_gpio()
-    socketio.emit('analysis_stopped')  # Notify frontend to update the settings
+    socketio.emit('analysis_stopped')
     logging.info("Analysis stopped")
     return jsonify({"status": "Analysis stopped"})
 
@@ -2177,10 +2624,27 @@ def stop_recording():
 
 @app.route('/update-settings', methods=['POST'])
 def update_settings():
-    """Update analysis settings"""
+    """Update analysis settings for the active session.
+
+    Accepts a JSON body with any combination of the fields below.
+    Settings take effect for the next data chunk; you do not need to
+    restart the stream (except for sampling_rate changes which reset
+    the filter coefficients).
+
+    Fields
+    ------
+    sampling_rate, lowcut, highcut, order : filter parameters
+    enabled_channels   : how many EEG channels to stream (1-8)
+    emg_enabled_channels : how many EMG channels to stream in dual-stream mode
+    baseline_correction_enabled, bandpass_filter_enabled, smoothing_enabled
+    ref_enabled, biasout_enabled : hardware-specific (PiEEG board)
+    downsample_factor  : integer decimation ratio (1 = no decimation)
+    features_enabled   : whether to compute and emit band-power / RMS features
+    """
     global lowcut, highcut, order, baseline_correction_enabled, enabled_channels
     global ref_enabled, biasout_enabled, bandpass_enabled, smoothing_enabled
     global fs, downsample_factor, current_stream_sampling_rate, features_enabled
+    global emg_enabled_channels
     
     data = request.json or {}
     # Mode-aware defaults
@@ -2198,7 +2662,9 @@ def update_settings():
     highcut = float(data.get('highcut', highcut_default))
     order = int(data.get('order', order))
     baseline_correction_enabled = data.get('baseline_correction_enabled', baseline_correction_enabled)
-    enabled_channels = int(data.get('enabled_channels', enabled_channels))
+    # Clamp channel counts to the hardware/software maximums
+    enabled_channels     = max(1, min(MAX_CHANNELS,     int(data.get('enabled_channels',     enabled_channels))))
+    emg_enabled_channels = max(1, min(MAX_EMG_CHANNELS, int(data.get('emg_enabled_channels', emg_enabled_channels))))
     ref_enabled = data.get('ref_enabled', ref_enabled)
     biasout_enabled = data.get('biasout_enabled', biasout_enabled)
     bandpass_enabled = data.get('bandpass_filter_enabled', bandpass_enabled)
