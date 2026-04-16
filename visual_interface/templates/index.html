@@ -71,6 +71,103 @@
         .metadata-empty { padding: 8px; color: #666; }
         .metadata-status { margin-top: 6px; font-size: 0.9rem; }
         .metadata-close { border: none; background: transparent; font-size: 1.2rem; cursor: pointer; }
+
+        /* ── File-replay player bar ───────────────────────────────────────────
+           Shown below the canvas only during file replay.
+           Hides automatically for live hardware / synthetic modes.           */
+        .player-bar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 4px 2px;
+        }
+        .player-bar input[type="range"] {
+            flex: 1;
+            accent-color: #4fc3f7;
+            cursor: pointer;
+        }
+        .player-bar-time {
+            font-size: 0.82em;
+            color: #aaa;
+            white-space: nowrap;
+            min-width: 90px;
+            text-align: right;
+        }
+
+        /* View-mode toggle buttons (Live / Freeze) in the waveform header */
+        .view-mode-btns {
+            display: flex;
+            gap: 0;
+            border: 1px solid #444;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        .view-mode-btns button {
+            background: #1e1e1e;
+            border: none;
+            color: #888;
+            font-size: 0.8em;
+            padding: 4px 12px;
+            cursor: pointer;
+            transition: background 0.12s, color 0.12s;
+        }
+        .view-mode-btns button.active {
+            background: #2a5a7a;
+            color: #fff;
+        }
+
+        /* ── Channel visibility grid ──────────────────────────────────────────
+           Replaces the old pill row.  Scales cleanly from 8 to 64 channels.
+           8 cells per row keeps the grid compact and readable at any count.   */
+        .ch-grid-controls {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 8px;
+            align-items: center;
+        }
+        .ch-grid-controls button {
+            padding: 3px 11px;
+            font-size: 0.78em;
+            background: #2a2a2a;
+            border: 1px solid #555;
+            border-radius: 4px;
+            color: #ccc;
+            cursor: pointer;
+            transition: background 0.12s;
+        }
+        .ch-grid-controls button:hover { background: #3d3d3d; }
+
+        /* Fixed 8-column grid. Each cell is a square whose border colour
+           matches the corresponding waveform trace. */
+        .ch-grid {
+            display: grid;
+            grid-template-columns: repeat(8, 30px);
+            gap: 4px;
+        }
+        .ch-cell {
+            width: 30px;
+            height: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.68em;
+            font-weight: 600;
+            border-radius: 5px;
+            cursor: pointer;
+            border: 2px solid;          /* colour set via element .style.borderColor */
+            background: #111;
+            color: #555;
+            opacity: 0.38;
+            transition: opacity 0.12s, background 0.12s;
+            user-select: none;
+        }
+        /* Active (visible) channel: full opacity + subtle background tint */
+        .ch-cell.active {
+            opacity: 1;
+            background: #1e1e1e;
+            color: #eee;
+        }
+        .ch-cell:hover { opacity: 0.75; }
         .meta-handle {
             cursor: grab;
             user-select: none;
@@ -97,6 +194,7 @@
             <div>
                 <div class="section signal-type-section">
                     <h2>Signal Type</h2>
+                    <!-- Single-stream mode: pick one signal at a time -->
                     <div class="signal-toggle">
                         <button id="signalEegBtn" class="signal-btn" onclick="setSignalType('eeg')">EEG</button>
                         <button id="signalEmgBtn" class="signal-btn" onclick="setSignalType('emg')">EMG</button>
@@ -105,6 +203,39 @@
                     <p id="signalDescription" class="signal-description">
                         Monitor electrical brain activity (EEG mode).
                     </p>
+
+                    <!-- Dual-stream toggle: runs EEG + EMG simultaneously.
+                         When enabled, a second chart panel appears below the
+                         main EEG chart showing multi-channel EMG in real time.
+                         Useful for synchronised data collection sessions
+                         (e.g. EEG headset + EMG bracelet during motor tasks). -->
+                    <div style="margin-top: 14px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 12px;">
+                        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                            <label class="switch" title="Show EEG and EMG side-by-side">
+                                <input type="checkbox" id="dualModeToggle" onchange="toggleDualMode()">
+                                <span class="slider"></span>
+                            </label>
+                            <span style="font-weight:600;">Synchronized EEG + EMG</span>
+                            <span style="color:#888; font-size:0.82em;">Stream both signals at once</span>
+                        </div>
+                        <!-- Shown when the user tries to enable dual-stream in hardware mode -->
+                        <div id="dualModeHardwareMsg" style="display:none; margin-top:8px; padding:8px 12px;
+                             background:rgba(255,152,0,0.15); border:1px solid #ff9800; border-radius:4px;
+                             font-size:13px; color:#ffb74d;">
+                            ⚠️ Synchronized EEG + EMG is currently available in <strong>Simulation mode</strong> only.
+                            Hardware EMG bracelet integration is in progress.
+                        </div>
+                        <!-- EMG channel count for the second panel (only visible in dual mode) -->
+                        <div id="emgChannelConfig" style="display:none; margin-top:10px;">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                EMG Channels
+                                <input type="number" id="emg_channels" min="1" max="16" value="8"
+                                       style="width:60px;"
+                                       oninput="updateDualModeSettings()"
+                                       title="Number of EMG channels to display in the second panel">
+                            </label>
+                        </div>
+                    </div>
                 </div>
                 <div class="section simulation-section">
                     <h2>Mode Selection</h2>
@@ -161,28 +292,22 @@
                 <div class="section">
                     <h2>Channel Settings</h2>
                     <div class="channel-settings">
+                        <!-- Number of active channels to acquire and display.
+                             PiEEG board: max 8.  DSI-24 headset: up to 24.
+                             Standard 64-ch cap: up to 64. -->
                         <label>Enabled Channels
-                            <input type="number" id="enabled_channels" min="1" max="8" value="8" oninput="updateSettings()">
+                            <input type="number" id="enabled_channels" min="1" max="64" value="8" oninput="updateSettings()">
                         </label>
                         <label><input type="checkbox" id="ref_enabled" checked onchange="updateSettings()"> REF Enabled</label>
                         <label><input type="checkbox" id="biasout_enabled" checked onchange="updateSettings()"> BIASOUT Enabled</label>
                     </div>
-                    <div class="channel-selector">
-                        <div class="channel-group">
-                            <h4>Channels</h4>
-                            <div id="channelList" class="channel-pills"></div>
-                        </div>
-                        <div class="channel-legend">
-                            <div class="color-box" style="background-color: yellow;"></div> Ch1
-                            <div class="color-box" style="background-color: orange;"></div> Ch2
-                            <div class="color-box" style="background-color: brown;"></div> Ch3
-                            <div class="color-box" style="background-color: green;"></div> Ch4
-                            <div class="color-box" style="background-color: purple;"></div> Ch5
-                            <div class="color-box" style="background-color: blue;"></div> Ch6
-                            <div class="color-box" style="background-color: grey;"></div> Ch7
-                            <div class="color-box" style="background-color: white;"></div> Ch8
-                        </div>
-                    </div>
+
+                    <!-- Channel visibility grid.
+                         Rebuilt by buildChannelSelectors() whenever the channel
+                         count changes. Each numbered cell matches the trace
+                         colour in the waveform chart. Bulk controls above the
+                         grid let you show/hide all or invert the selection. -->
+                    <div id="channelList"></div>
                 </div>
             </div>
         </div>
@@ -193,18 +318,89 @@
                 <div class="waveform-mode">
                     <label for="waveformModeSelect">Display</label>
                     <select id="waveformModeSelect" onchange="setChartMode(this.value)">
-                        <option value="overlap" selected>Overlap</option>
-                        <option value="stacked">EEG stacked</option>
+                        <option value="overlap">Overlap</option>
+                        <option value="stacked" selected>EEG stacked</option>
                     </select>
+                </div>
+                <!-- View mode: Live = auto-scroll, Freeze = chart paused for analysis.
+                     In file-replay mode Freeze also pauses the server stream,
+                     so Resume continues from exactly where you stopped. -->
+                <div class="view-mode-btns" title="Live: chart follows newest data. Freeze: pause the chart (and file replay) to analyse a moment, then resume.">
+                    <button id="viewModeLiveBtn"   class="active" onclick="setViewMode('live')">Live</button>
+                    <button id="viewModeFreezeBtn"             onclick="setViewMode('freeze')">⏸ Freeze</button>
                 </div>
                 <div id="qualityOverlay" class="quality-overlay">Quality Alert: Signal quality low</div>
             </div>
             <canvas id="eegChart"></canvas>
+
+            <!-- ── File-replay player bar ────────────────────────────────────
+                 Shown only when a file has been loaded for replay.
+                 Lets you seek to any point in the file and shows progress.
+                 Hidden for live hardware / synthetic simulation.
+            ──────────────────────────────────────────────────────────────── -->
+            <div id="playerBar" class="player-bar" style="display:none;">
+                <input type="range" id="playerScrubber"
+                       min="0" max="1000" value="0" step="1"
+                       oninput="onPlayerScrubberDrag(this.value)"
+                       onchange="onPlayerScrubberCommit(this.value)"
+                       title="Drag to seek within the file">
+                <span id="playerTime" class="player-bar-time">0:00 / 0:00</span>
+            </div>
+
             <div class="controls">
                 <button id="startBtn" onclick="startAnalysis()">Start Stream</button>
                 <button id="stopBtn" onclick="stopAnalysis()" disabled>Stop Stream</button>
-                <button id="calibrateBtn" onclick="startCalibration()">Calibrate</button>
+                <button id="calibrateBtn" onclick="startCalibration()"
+                        title="Calibrate measures the DC baseline of each channel over 5 seconds. The per-channel offsets are then subtracted from live data when 'Baseline Correction' is enabled, removing electrode drift and DC offset.">Calibrate</button>
                 <button id="exportBtn" onclick="exportData()">Export Buffer</button>
+            </div>
+        </div>
+
+        <!-- ================================================================
+             EMG DUAL-STREAM PANEL
+             Shown only when "Synchronized EEG + EMG" is toggled on.
+             Each channel from the EMG bracelet (or simulation) is rendered
+             as a separate coloured trace so team members can see individual
+             muscle channels at a glance. The stacked layout (default) makes
+             it easy to compare activation timing across channels.
+             ================================================================ -->
+        <div id="emgChartSection" class="section big-visual" style="display:none;">
+            <div class="section-header">
+                <h2>EMG — Real-time Channels</h2>
+                <div class="waveform-mode">
+                    <label for="emgWaveformModeSelect">Display</label>
+                    <!-- Stacked = each channel on its own baseline (easier to read individual activations)
+                         Overlap = all channels share the same y-axis (useful for amplitude comparison) -->
+                    <select id="emgWaveformModeSelect" onchange="setEmgChartMode(this.value)">
+                        <option value="stacked" selected>Stacked</option>
+                        <option value="overlap">Overlap</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- The canvas that Chart.js renders the EMG waveforms into -->
+            <canvas id="emgChart"></canvas>
+
+            <!-- Per-channel visibility toggles for the EMG panel.
+                 Click a pill to hide/show that channel — same as the EEG panel. -->
+            <div style="margin-top:10px;">
+                <div class="channel-group">
+                    <h4>EMG Channels</h4>
+                    <div id="emgChannelList" class="channel-pills"></div>
+                </div>
+            </div>
+
+            <!-- Live EMG metrics: RMS per channel gives a quick view of which
+                 muscles are active and how strongly they are contracting. -->
+            <div id="emgMetricsRow" style="margin-top:10px; display:flex; gap:12px; flex-wrap:wrap;">
+                <div class="metric-card">
+                    <span class="metric-label">EMG RMS (avg)</span>
+                    <span id="emgRms" class="metric-value">--</span>
+                </div>
+                <div class="metric-card">
+                    <span class="metric-label">EMG MAV (avg)</span>
+                    <span id="emgMav" class="metric-value">--</span>
+                </div>
             </div>
         </div>
 
