@@ -1,28 +1,73 @@
-// Socket.IO connection
+// Socket.IO connection — real-time bidirectional link between browser and Flask server
 const socket = io();
 
-const channelColors = [
-  'rgb(255, 99, 132)',
-  'rgb(54, 162, 235)',
-  'rgb(255, 206, 86)',
-  'rgb(75, 192, 192)',
-  'rgb(153, 102, 255)',
-  'rgb(255, 159, 64)',
-  'rgb(199, 199, 199)',
-  'rgb(83, 102, 255)'
-];
+// ─────────────────────────────────────────────────────────────────────────────
+// Channel capacity constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Maximum number of EEG channels the UI supports.
+// Standard high-density EEG caps (e.g. 10–20 system, actiCAP) go up to 64.
+// The PiEEG board is limited to 8, but the DSI-24 headset uses 24 channels.
+// Setting this to 64 makes the code forward-compatible with any device we add.
+const MAX_EEG_CHANNELS = 64;
+
+// Maximum EMG channels — the upcoming N-Pulse bracelet prototype is expected
+// to provide 8–16 channels. 16 gives enough headroom for future revisions.
+const MAX_EMG_CHANNELS = 16;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Colour palettes — generated programmatically so they scale to any channel count
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Generate an array of `count` perceptually distinct HSL colours.
+ *
+ * We use the golden-angle increment (≈137.5°) to distribute hues around the
+ * colour wheel.  This maximises the perceptual distance between *adjacent*
+ * channel indices — so channels 1 and 2 look very different, channels 1 and 3
+ * also look different, etc.  It is the same technique used in many scientific
+ * data-visualisation libraries (e.g. D3, matplotlib's tab20).
+ *
+ * @param {number} count      Number of colours to generate.
+ * @param {number} hueOffset  Starting hue in degrees (0 = red).
+ * @param {number} sat        Saturation % (0-100).
+ * @param {number} lightBase  Base lightness % — odd indices get +8 for extra separation.
+ * @returns {string[]}        Array of CSS `hsl(…)` strings.
+ */
+function generateColorPalette(count, hueOffset = 0, sat = 75, lightBase = 60) {
+  return Array.from({ length: count }, (_, i) => {
+    const hue   = Math.round((hueOffset + i * 137.508) % 360); // golden angle
+    const light = lightBase + (i % 2) * 8;                     // alternate lightness
+    return `hsl(${hue}, ${sat}%, ${light}%)`;
+  });
+}
+
+// EEG channels — full hue wheel, 64 entries.
+// Each channel gets a distinct colour even at high density (e.g. 64-channel cap).
+const channelColors = generateColorPalette(MAX_EEG_CHANNELS, 0, 75, 60);
+
+// EMG channels — offset by 160° so the EMG panel palette starts in the
+// blue-green range.  This makes it immediately obvious which panel is EEG
+// and which is EMG even when glancing at the screen quickly.
+const emgChannelColors = generateColorPalette(MAX_EMG_CHANNELS, 160, 85, 62);
 
 const headChannels = [0, 1, 2, 3];
 const armChannels = [4, 5, 6, 7];
 
-let channelVisibility = Array(8).fill(true);
+// ─────────────────────────────────────────────────────────────────────────────
+// EEG chart state (primary panel)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One visibility flag per channel.  Initialised to all-visible for the full
+// MAX_EEG_CHANNELS capacity; the UI shows only the 'enabled' subset.
+let channelVisibility = Array(MAX_EEG_CHANNELS).fill(true);
 let chart = null;
 let bandPowerChart = null;
 let featureTimeChart = null;
 let featureHistory = [];
 let isSimulationMode = false;
 let currentSignalType = 'eeg';
-let chartMode = 'overlap';
+let chartMode = 'stacked';
 let isRecording = false;
 let isRecordingPaused = false;
 let markers = [];
@@ -39,19 +84,65 @@ const MAX_EVENT_OVERLAY_LINES = 120;
 const MAX_RENDER_POINTS = 1200;
 const FEATURE_UPDATE_INTERVAL_MS = 400;
 
-let waveformBuffers = Array.from({ length: 8 }, () => []);
+// One rolling buffer per channel, pre-allocated to the maximum channel count.
+// Each buffer holds { x: timeSeconds, y: amplitude } objects for the last
+// waveformWindowSec seconds.  syncWaveformBuffers() keeps this in sync with
+// the currently enabled channel count.
+let waveformBuffers = Array.from({ length: MAX_EEG_CHANNELS }, () => []);
 let lastSampleTimestamp = 0;
 let stackedOffsets = [];
 let currentWindowStartSec = 0;
 let lastFeatureUpdateMs = 0;
 
+// ── View mode: 'live' vs 'freeze' ────────────────────────────────────────────
+// 'live'   – chart window auto-follows the newest incoming data (default)
+// 'freeze' – chart is pinned at the moment Freeze was clicked.
+//            For file replay this also pauses the server so no new data
+//            arrives and you can analyse that exact moment.
+//            Click Live (or ↩ Resume) to continue from where you stopped.
+let viewMode = 'live';
+let freezePositionSec = 0;  // timestamp (s) at which the chart was frozen
+
+// ── File-replay player state ──────────────────────────────────────────────────
+// Only relevant when streaming a .fif / .edf / .json / .xdf file.
+// isFileReplayMode is set to true when the server emits 'playback_info'.
+let isFileReplayMode    = false;
+let playerTotalSec      = 0;
+let playerTotalSamples  = 0;
+let playerSamplingRate  = 250;
+let playerScrubDragging = false;  // suppress progress ticks while dragging
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EMG chart state (secondary panel — only active in dual-stream mode)
+//
+// These mirror the EEG variables but are fully independent so the two
+// streams never interfere with each other.  The EMG panel can have a
+// different number of channels, its own display mode, and its own rolling
+// data buffers.
+// ─────────────────────────────────────────────────────────────────────────────
+let emgChart = null;
+let emgChartMode = 'stacked';  // 'stacked' (default) or 'overlap'
+let isDualStreamMode = false;
+let emgEnabledChannels = 8;
+
+// Rolling waveform buffers for the EMG panel — same structure as waveformBuffers.
+// Each entry is an array of { x: timeSeconds, y: amplitude } objects.
+// Pre-allocated to MAX_EMG_CHANNELS so resizing is never needed at runtime.
+let emgWaveformBuffers = Array.from({ length: MAX_EMG_CHANNELS }, () => []);
+let emgChannelVisibility = Array(MAX_EMG_CHANNELS).fill(true);
+let emgLastSampleTimestamp = 0;
+let emgStackedOffsets = [];
+
 // Initialize the UI on page load
 document.addEventListener('DOMContentLoaded', () => {
   currentSignalType = window.initialSignalType || 'eeg';
+
   const modeSelect = document.getElementById('waveformModeSelect');
-  if (modeSelect) {
-    chartMode = modeSelect.value || 'overlap';
-  }
+  if (modeSelect) chartMode = modeSelect.value || 'stacked';
+
+  // Ensure view-mode button state matches the JS default
+  setViewMode('live');
+
   buildChannelSelectors();
   initializeChart();
   initializeFeatureCharts();
@@ -60,6 +151,16 @@ document.addEventListener('DOMContentLoaded', () => {
   loadMetadata();
   renderMarkers();
   renderSessionSummary();
+
+  // If dual-stream mode was already active (e.g. page reload), set up the EMG panel.
+  // In practice the server resets dual_stream_mode on startup, so this is mostly
+  // a defensive initialisation for the UI state.
+  if (isDualStreamMode) {
+    buildEmgChannelSelectors();
+    initializeEmgChart();
+    const section = document.getElementById('emgChartSection');
+    if (section) section.style.display = '';
+  }
 });
 
 function parseJsonResponse(response) {
@@ -93,37 +194,92 @@ function getEnabledChannels() {
   return parseInt(document.getElementById('enabled_channels').value, 10) || 8;
 }
 
+/**
+ * Keep waveformBuffers and channelVisibility arrays in sync with the current
+ * enabled channel count.
+ *
+ * Called every time the user changes the channel count (via updateSettings).
+ * We grow the arrays when needed and shrink channelVisibility to the active
+ * count so the grid does not render cells beyond what the hardware/simulation
+ * is producing.
+ *
+ * @param {number} enabled  Current number of active EEG channels (1–64).
+ */
 function syncWaveformBuffers(enabled) {
-  while (waveformBuffers.length < channelColors.length) {
-    waveformBuffers.push([]);
-  }
-  waveformBuffers = waveformBuffers.slice(0, channelColors.length);
+  // Grow the buffer array up to the full capacity if necessary
+  while (waveformBuffers.length < MAX_EEG_CHANNELS) waveformBuffers.push([]);
+  waveformBuffers = waveformBuffers.slice(0, MAX_EEG_CHANNELS);
   for (let i = 0; i < waveformBuffers.length; i += 1) {
-    if (!Array.isArray(waveformBuffers[i])) {
-      waveformBuffers[i] = [];
-    }
+    if (!Array.isArray(waveformBuffers[i])) waveformBuffers[i] = [];
   }
-  // Ensure visibility array stays aligned with channel count
-  channelVisibility = channelVisibility.slice(0, enabled);
-  while (channelVisibility.length < enabled) {
-    channelVisibility.push(true);
-  }
+  // Grow visibility array to cover all capacity slots (default: visible)
+  while (channelVisibility.length < MAX_EEG_CHANNELS) channelVisibility.push(true);
 }
 
+/** Clear all EEG waveform buffers and reset the time counter. */
 function resetWaveformBuffers() {
-  waveformBuffers = Array.from({ length: channelColors.length }, () => []);
+  waveformBuffers = Array.from({ length: MAX_EEG_CHANNELS }, () => []);
   lastSampleTimestamp = 0;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Channel grid  —  replaces the old pill list
+//
+// Design rationale
+// ─────────────────
+// The old "Ch 1 … Ch 8" pill row works for 8 channels but becomes unusable
+// at 24 or 64 channels (the pills overflow and you cannot tell channels apart).
+//
+// The new grid:
+//   • Shows all enabled channels as small numbered squares in 8 columns.
+//   • Each square uses the channel's trace colour as its border.
+//   • Active (visible) channels are fully opaque; hidden ones are dimmed.
+//   • Three bulk-control buttons (All / None / Invert) let a researcher
+//     quickly isolate a region or reset visibility without clicking 64 times.
+//   • Scales from 1 to 64 channels without any layout changes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Rebuild the channel-visibility grid inside #channelList.
+ *
+ * Call this after the enabled channel count changes or on initial page load.
+ * The function also syncs the underlying Chart.js dataset visibility so the
+ * waveform chart immediately reflects the current grid state.
+ */
 function buildChannelSelectors() {
   const container = document.getElementById('channelList');
   if (!container) return;
+
   const enabled = getEnabledChannels();
   syncWaveformBuffers(enabled);
-  container.innerHTML = '';
-  for (let idx = 0; idx < enabled; idx += 1) {
-    createChannelPill(idx, container);
+
+  // ── Bulk-control toolbar ──────────────────────────────────────────────────
+  // Three small buttons that operate on all enabled channels at once.
+  // Useful when a researcher wants to isolate one channel (None → click one)
+  // or reset after exploring (All).
+  container.innerHTML = `
+    <div class="ch-grid-controls">
+      <button onclick="selectAllChannels(true)"  title="Show all channels">All</button>
+      <button onclick="selectAllChannels(false)" title="Hide all channels">None</button>
+      <button onclick="invertChannelSelection()" title="Flip visibility of every channel">Invert</button>
+    </div>
+    <div id="chGrid" class="ch-grid"></div>
+  `;
+
+  // ── Channel cells ─────────────────────────────────────────────────────────
+  const grid = container.querySelector('#chGrid');
+  for (let idx = 0; idx < enabled; idx++) {
+    const cell = document.createElement('div');
+    cell.className = 'ch-cell' + (channelVisibility[idx] ? ' active' : '');
+    cell.textContent = idx + 1;          // show channel number (1-based)
+    cell.title = `Channel ${idx + 1} — click to toggle visibility`;
+    cell.style.borderColor = channelColors[idx];  // matches the trace colour
+    cell.dataset.index = idx;
+    cell.onclick = () => toggleChannel(idx, cell);
+    grid.appendChild(cell);
   }
+
+  // Sync the Chart.js dataset hidden-flags to match the current visibility state
   if (chart) {
     chart.data.datasets.forEach((ds, idx) => {
       ds.hidden = idx >= enabled ? true : !channelVisibility[idx];
@@ -132,24 +288,57 @@ function buildChannelSelectors() {
   }
 }
 
-function createChannelPill(index, container) {
-  const pill = document.createElement('div');
-  pill.className = 'channel-pill' + (channelVisibility[index] ? ' active' : '');
-  pill.textContent = `Ch ${index + 1}`;
-  pill.style.borderColor = channelColors[index];
-  pill.onclick = () => toggleChannel(index, pill);
-  container.appendChild(pill);
-}
-
-function toggleChannel(index, pill) {
+/**
+ * Toggle an individual EEG channel on or off.
+ *
+ * @param {number} index  Zero-based channel index.
+ * @param {Element} cell  The grid cell DOM element (gets the 'active' class toggled).
+ */
+function toggleChannel(index, cell) {
   channelVisibility[index] = !channelVisibility[index];
-  if (pill) {
-    pill.classList.toggle('active', channelVisibility[index]);
-  }
+  if (cell) cell.classList.toggle('active', channelVisibility[index]);
   if (chart && chart.data.datasets[index]) {
     chart.data.datasets[index].hidden = !channelVisibility[index];
     renderWaveform();
   }
+}
+
+/**
+ * Show or hide all currently enabled EEG channels at once.
+ *
+ * @param {boolean} visible  true = show all, false = hide all.
+ */
+function selectAllChannels(visible) {
+  const enabled = getEnabledChannels();
+  for (let i = 0; i < enabled; i++) {
+    channelVisibility[i] = visible;
+    if (chart && chart.data.datasets[i]) {
+      chart.data.datasets[i].hidden = !visible;
+    }
+  }
+  // Refresh cell appearance in the grid
+  document.querySelectorAll('#chGrid .ch-cell').forEach((cell, i) => {
+    cell.classList.toggle('active', channelVisibility[i]);
+  });
+  renderWaveform();
+}
+
+/**
+ * Flip the visibility of every enabled EEG channel.
+ * Useful for quickly switching focus between two groups (e.g. frontal vs occipital).
+ */
+function invertChannelSelection() {
+  const enabled = getEnabledChannels();
+  for (let i = 0; i < enabled; i++) {
+    channelVisibility[i] = !channelVisibility[i];
+    if (chart && chart.data.datasets[i]) {
+      chart.data.datasets[i].hidden = !channelVisibility[i];
+    }
+  }
+  document.querySelectorAll('#chGrid .ch-cell').forEach((cell, i) => {
+    cell.classList.toggle('active', channelVisibility[i]);
+  });
+  renderWaveform();
 }
 
 const stackedLabelPlugin = {
@@ -258,12 +447,19 @@ function buildChartOptions() {
         display: true,
         min: 0,
         max: waveformWindowSec,
-        title: { display: true, text: 'Time (s)' },
+        title: { display: true, text: 'Time' },
         ticks: {
           maxTicksLimit: 6,
+          // Show absolute file time (m:ss) so the position is clear after a seek.
+          // currentWindowStartSec is added to each relative tick value so that
+          // e.g. after seeking to 2:41 the axis reads "2:41  2:43  2:45  2:47  2:49"
+          // rather than "0  2  4  6  8".
           callback: value => {
-            const num = Number(value);
-            return Number.isFinite(num) ? num.toFixed(1) : value;
+            const abs = currentWindowStartSec + Number(value);
+            if (!Number.isFinite(abs)) return value;
+            const m   = Math.floor(abs / 60);
+            const s   = Math.floor(abs % 60);
+            return `${m}:${s.toString().padStart(2, '0')}`;
           }
         }
       },
@@ -296,10 +492,13 @@ function initializeChart() {
   chart = new Chart(ctx, {
     type: 'line',
     data: {
-      datasets: channelColors.map((color, idx) => ({
+      // One dataset per channel, pre-created for all MAX_EEG_CHANNELS.
+      // Datasets beyond 'enabled' start hidden; they unhide if the user raises
+      // the channel count, so Chart.js never needs to be fully rebuilt.
+      datasets: Array.from({ length: MAX_EEG_CHANNELS }, (_, idx) => ({
         label: `${currentSignalType.toUpperCase()} Channel ${idx + 1}`,
         data: [],
-        borderColor: color,
+        borderColor: channelColors[idx],
         borderWidth: 1.4,
         tension: 0.05,
         pointRadius: 0,
@@ -369,6 +568,14 @@ function toggleSimulation() {
 
   if (fileUploadSection) {
     fileUploadSection.style.display = isSimulationMode ? 'block' : 'none';
+  }
+
+  // If the user switches to hardware mode while the hardware-mode warning is
+  // showing, keep it visible (it's still relevant).  If they switch back to
+  // simulation mode, hide it — dual-stream is now available again.
+  if (isSimulationMode) {
+    const hardwareMsg = document.getElementById('dualModeHardwareMsg');
+    if (hardwareMsg) hardwareMsg.style.display = 'none';
   }
 
   fetch('/toggle-simulation', {
@@ -488,8 +695,19 @@ function startAnalysis() {
     .then(() => {
       resetWaveformBuffers();
       renderWaveform();
+      // If dual-stream mode is on, reset the EMG buffers too so the second
+      // panel starts fresh at the same moment as the EEG panel.
+      if (isDualStreamMode) {
+        resetEmgWaveformBuffers();
+        renderEmgWaveform();
+      }
       document.getElementById('startBtn').disabled = true;
       document.getElementById('stopBtn').disabled = false;
+      // Lock the dual-mode toggle while streaming — the server rejects changes mid-stream
+      const dualToggle = document.getElementById('dualModeToggle');
+      if (dualToggle) dualToggle.disabled = true;
+      // Reset to live view whenever a new stream starts
+      setViewMode('live');
     })
     .catch(error => {
       console.error('[client] Error starting analysis:', error);
@@ -504,6 +722,13 @@ function stopAnalysis() {
     .then(() => {
       document.getElementById('startBtn').disabled = false;
       document.getElementById('stopBtn').disabled = true;
+      // Re-enable the dual-mode toggle now that the stream has stopped
+      const dualToggle = document.getElementById('dualModeToggle');
+      if (dualToggle) dualToggle.disabled = false;
+      // Hide the file-replay player bar and reset replay state
+      playerTeardown();
+      // Snap back to live view
+      setViewMode('live');
     })
     .catch(error => console.error('[client] Error stopping analysis:', error));
 }
@@ -1150,18 +1375,716 @@ function saveMetadata(silent = false) {
     });
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// VIEW MODE  —  Live vs Freeze
+//
+//   Live   – chart auto-scrolls with incoming data (default)
+//   Freeze – chart is pinned at the moment Freeze was clicked.
+//            For file replay this also pauses the server so no new samples
+//            arrive, letting you analyse that exact moment without the signal
+//            running away.  Clicking Live resumes from exactly where it paused.
+//
+//   For live hardware there is no server pause, but the chart stops updating
+//   so you can still measure peaks, latencies etc. on the frozen view.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Switch between 'live' and 'freeze' view modes.
+ *
+ * @param {string} mode  'live' or 'freeze'
+ */
+function setViewMode(mode) {
+  viewMode = mode;
+
+  const liveBtn   = document.getElementById('viewModeLiveBtn');
+  const freezeBtn = document.getElementById('viewModeFreezeBtn');
+
+  if (liveBtn)   liveBtn.classList.toggle('active',   mode === 'live');
+  if (freezeBtn) freezeBtn.classList.toggle('active', mode === 'freeze');
+
+  if (mode === 'freeze') {
+    // Remember the timestamp so renderWaveform() shows this exact window
+    freezePositionSec = Math.max(0, lastSampleTimestamp - waveformWindowSec);
+
+    // For file replay: tell the server to stop emitting so the chart really
+    // stays at this exact moment and resumes from here on Live.
+    if (isFileReplayMode) {
+      fetch('/pause-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paused: true })
+      }).catch(err => console.error('[viewMode] Pause failed:', err));
+    }
+  } else {
+    // Resuming — for file replay tell the server to continue streaming
+    if (isFileReplayMode) {
+      fetch('/pause-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paused: false })
+      }).catch(err => console.error('[viewMode] Resume failed:', err));
+    }
+  }
+
+  renderWaveform();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FILE-REPLAY PLAYER BAR
+//
+// Shown automatically when the server starts replaying a file.
+// Lets the user seek to any position in the file.
+// Pause/Resume is the Freeze/Live toggle above.
+//
+//   server ──playback_info──►    playerSetup()       (once at stream start)
+//   server ──playback_progress──► playerTick()       (every ~100 ms chunk)
+//   drag scrubber ──► onPlayerScrubberCommit() ──► POST /seek-stream
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** Show the player bar and store file metadata received from the server. */
+function playerSetup(info) {
+  isFileReplayMode   = true;
+  playerTotalSamples = info.total_samples  || 0;
+  playerTotalSec     = info.total_time_sec || 0;
+  playerSamplingRate = info.sampling_rate  || 250;
+
+  const bar      = document.getElementById('playerBar');
+  const scrubber = document.getElementById('playerScrubber');
+  if (!bar || !scrubber) return;
+
+  scrubber.min   = 0;
+  scrubber.max   = playerTotalSamples;
+  scrubber.value = 0;
+  bar.style.display = 'flex';
+  playerUpdateTime(0);
+}
+
+/** Hide the player bar and reset state. Called on Stop. */
+function playerTeardown() {
+  isFileReplayMode    = false;
+  playerScrubDragging = false;
+  const bar = document.getElementById('playerBar');
+  if (bar) bar.style.display = 'none';
+}
+
+/**
+ * Advance the scrubber thumb as file replay progresses.
+ * Ignored while the user is dragging to avoid fighting their input.
+ */
+function playerTick(data) {
+  if (!isFileReplayMode || playerScrubDragging) return;
+  const scrubber = document.getElementById('playerScrubber');
+  if (scrubber) scrubber.value = data.current_sample;
+  playerUpdateTime(data.current_time_sec, data.total_time_sec);
+}
+
+/** Update the time label (m:ss / m:ss). */
+function playerUpdateTime(current, total) {
+  const fmt = s => {
+    const m = Math.floor((s || 0) / 60);
+    const sec = Math.floor((s || 0) % 60);
+    return `${m}:${sec.toString().padStart(2, '0')}`;
+  };
+  const el = document.getElementById('playerTime');
+  if (el) el.textContent = `${fmt(current)} / ${fmt(total ?? playerTotalSec)}`;
+}
+
+/**
+ * Live preview while the user drags the scrubber.
+ * Only updates the time label — no server request yet.
+ */
+function onPlayerScrubberDrag(value) {
+  playerScrubDragging = true;
+  const timeSec = playerSamplingRate > 0 ? parseInt(value, 10) / playerSamplingRate : 0;
+  playerUpdateTime(timeSec);
+}
+
+/**
+ * Seek when the user releases the scrubber thumb.
+ *
+ * The operations MUST be sequential to avoid a race condition where the
+ * server resumes before the seek takes effect (causing it to emit chunks
+ * from the wrong position into the freshly-cleared buffer):
+ *
+ *   1. Pause  – stop the server emitting so no stale chunks arrive
+ *   2. Reset  – clear client buffers (safe: server is idle)
+ *   3. Seek   – tell the server the new file position
+ *   4. Resume – start streaming from the new position
+ *
+ * Result: ~200–400 ms blank chart, then signal from the exact seek point.
+ */
+function onPlayerScrubberCommit(value) {
+  playerScrubDragging = false;
+  const sample      = parseInt(value, 10);
+  // Convert sample index → seconds so we can anchor the chart's time axis.
+  const seekTimeSec = playerSamplingRate > 0 ? sample / playerSamplingRate : 0;
+
+  const postJson = (url, body) => fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }).then(parseJsonResponse);
+
+  // Sequential: pause → clear buffers → seek → resume.
+  // Keeping these strictly in order prevents the server from sending stale
+  // chunks into the freshly-cleared buffer between steps.
+  postJson('/pause-stream', { paused: true })
+    .then(() => {
+      // Clear buffer data so old signal disappears immediately.
+      // Crucially: restore lastSampleTimestamp to the seek position AFTER the
+      // reset (which would zero it).  This anchors the chart's time axis at the
+      // correct file time — e.g. 161 s for 2:41 — so the x-axis labels show
+      // "2:41 – 2:49" instead of "0 – 8" when data from the new position arrives.
+      resetWaveformBuffers();            // → lastSampleTimestamp = 0
+      lastSampleTimestamp = seekTimeSec; // → restore to file position (e.g. 161 s)
+      if (isDualStreamMode) resetEmgWaveformBuffers();
+      renderWaveform();                  // show blank chart at the correct time
+
+      return postJson('/seek-stream', { sample });
+    })
+    .then(() => {
+      // Resume from the new position; update UI to Live directly
+      // (avoids a redundant second /pause-stream call that setViewMode would add).
+      viewMode = 'live';
+      document.getElementById('viewModeLiveBtn')?.classList.add('active');
+      document.getElementById('viewModeFreezeBtn')?.classList.remove('active');
+      return postJson('/pause-stream', { paused: false });
+    })
+    .catch(err => console.error('[player] Seek failed:', err));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DUAL-STREAM MODE  —  synchronized EEG + EMG functions
+// ═════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Toggle the synchronized EEG + EMG dual-stream mode on/off.
+ *
+ * When enabled:
+ *  • Tells the server to start a second EMG acquisition thread on /start-analysis.
+ *  • Shows the EMG chart panel and the EMG channel controls.
+ *  • Initialises (or destroys) the second Chart.js instance.
+ *
+ * The server rejects the toggle while streaming is active, so the button
+ * is disabled between Start and Stop.
+ */
+function toggleDualMode() {
+  const toggle = document.getElementById('dualModeToggle');
+  const hardwareMsg = document.getElementById('dualModeHardwareMsg');
+
+  // Dual-stream is simulation-only for now — the hardware EMG bracelet
+  // integration is not yet wired up on the server side.  If the user tries
+  // to enable the toggle in hardware mode, revert it immediately and show
+  // a clear inline message instead of silently producing a blank EMG panel.
+  if (toggle.checked && !isSimulationMode) {
+    toggle.checked = false;          // revert the visual state
+    if (hardwareMsg) hardwareMsg.style.display = '';
+    return;
+  }
+  // Hide the hardware-mode warning whenever the toggle is turned off or
+  // the user is already in simulation mode.
+  if (hardwareMsg) hardwareMsg.style.display = 'none';
+
+  isDualStreamMode = toggle.checked;
+  emgEnabledChannels = parseInt(document.getElementById('emg_channels')?.value || '8', 10);
+
+  fetch('/toggle-dual-mode', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dual_mode: isDualStreamMode, emg_channels: emgEnabledChannels })
+  })
+    .then(parseJsonResponse)
+    .then(() => {
+      // Show/hide the EMG panel and channel-count input
+      const section = document.getElementById('emgChartSection');
+      const config  = document.getElementById('emgChannelConfig');
+      if (section) section.style.display = isDualStreamMode ? '' : 'none';
+      if (config)  config.style.display  = isDualStreamMode ? '' : 'none';
+
+      if (isDualStreamMode) {
+        // Build or rebuild the EMG chart with the current channel count
+        buildEmgChannelSelectors();
+        initializeEmgChart();
+      } else {
+        // Clean up the Chart.js instance to free canvas memory
+        if (emgChart) { emgChart.destroy(); emgChart = null; }
+        resetEmgWaveformBuffers();
+      }
+    })
+    .catch(err => {
+      console.error('[client] Error toggling dual mode:', err);
+      // Roll back the checkbox on failure (e.g. stream was still running)
+      toggle.checked = !isDualStreamMode;
+      isDualStreamMode = toggle.checked;
+      alert(err.message || 'Cannot change dual-stream mode while streaming is active.');
+    });
+}
+
+/**
+ * Called when the EMG channel count input changes in dual-stream mode.
+ * Sends the new count to the server and rebuilds the EMG chart.
+ */
+function updateDualModeSettings() {
+  emgEnabledChannels = parseInt(document.getElementById('emg_channels')?.value || '8', 10);
+  if (!isDualStreamMode) return;
+
+  fetch('/toggle-dual-mode', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dual_mode: true, emg_channels: emgEnabledChannels })
+  })
+    .then(parseJsonResponse)
+    .then(() => {
+      buildEmgChannelSelectors();
+      initializeEmgChart();
+    })
+    .catch(err => console.error('[client] Error updating EMG channel count:', err));
+}
+
+/** Returns the current number of active EMG channels. */
+function getEmgEnabledChannels() {
+  return emgEnabledChannels;
+}
+
+/** Clear all EMG waveform buffers and reset the time counter. */
+function resetEmgWaveformBuffers() {
+  emgWaveformBuffers = Array.from({ length: MAX_EMG_CHANNELS }, () => []);
+  emgLastSampleTimestamp = 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EMG chart initialisation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Create (or recreate) the Chart.js instance for the EMG panel.
+ *
+ * The chart is an independent line chart with one dataset per EMG channel.
+ * Default display mode is 'stacked' — each channel is offset vertically so
+ * individual muscle activations are easy to read (same as EEG stacked mode).
+ */
+function initializeEmgChart() {
+  const canvas = document.getElementById('emgChart');
+  if (!canvas) return;
+
+  if (emgChart) { emgChart.destroy(); }
+
+  const enabled = getEmgEnabledChannels();
+  emgChart = new Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: {
+      // One dataset per channel, pre-created for all MAX_EMG_CHANNELS.
+      // Datasets beyond 'enabled' are hidden; they become visible if the user
+      // increases the channel count without reloading the page.
+      datasets: Array.from({ length: MAX_EMG_CHANNELS }, (_, idx) => ({
+        label: `EMG Ch ${idx + 1}`,
+        data: [],
+        borderColor: emgChannelColors[idx] || '#aaa',
+        borderWidth: 1.3,
+        tension: 0.05,
+        pointRadius: 0,
+        hidden: idx >= enabled ? true : !emgChannelVisibility[idx]
+      }))
+    },
+    options: buildEmgChartOptions(),
+    plugins: [emgStackedLabelPlugin]
+  });
+}
+
+/** Build Chart.js options for the EMG panel based on the current display mode. */
+function buildEmgChartOptions() {
+  const range = { min: -300, max: 300 };  // EMG amplitude range in µV
+  return {
+    responsive: true,
+    animation: false,
+    parsing: false,
+    normalized: true,
+    scales: {
+      x: {
+        type: 'linear',
+        display: true,
+        min: 0,
+        max: waveformWindowSec,
+        title: { display: true, text: 'Time (s)' },
+        ticks: {
+          maxTicksLimit: 6,
+          callback: value => Number.isFinite(Number(value)) ? Number(value).toFixed(1) : value
+        }
+      },
+      y: {
+        display: emgChartMode !== 'stacked',
+        title: { display: emgChartMode !== 'stacked', text: 'Amplitude (µV)' },
+        min: range.min,
+        max: range.max,
+        grid: { color: 'rgba(255, 255, 255, 0.05)' }
+      }
+    },
+    plugins: {
+      legend: { display: emgChartMode === 'overlap', position: 'top' }
+    },
+    layout: emgChartMode === 'stacked'
+      ? { padding: { left: 70, right: 10, top: 10, bottom: 10 } }
+      : {}
+  };
+}
+
+/**
+ * Custom Chart.js plugin that draws channel labels on the left margin of the
+ * EMG chart when in stacked mode — mirrors the EEG stackedLabelPlugin.
+ */
+const emgStackedLabelPlugin = {
+  id: 'emgStackedLabels',
+  afterDatasetsDraw(chartInstance) {
+    if (emgChartMode !== 'stacked') return;
+    const { ctx, chartArea, scales } = chartInstance;
+    if (!chartArea || !scales?.y) return;
+    ctx.save();
+    ctx.fillStyle = '#80cbc4';  // teal tint to match EMG colour palette
+    ctx.font = '12px Arial';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    const enabled = getEmgEnabledChannels();
+    for (let i = 0; i < enabled; i++) {
+      const dataset = chartInstance.data.datasets[i];
+      if (!dataset || dataset.hidden) continue;
+      const offset = emgStackedOffsets[i] || 0;
+      const y = scales.y.getPixelForValue(offset);
+      ctx.fillText(`EMG ${i + 1}`, chartArea.left - 10, y);
+    }
+    ctx.restore();
+  }
+};
+
+/** Switch between 'stacked' and 'overlap' display modes for the EMG chart. */
+function setEmgChartMode(mode) {
+  emgChartMode = mode === 'stacked' ? 'stacked' : 'overlap';
+  initializeEmgChart();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EMG channel selector grid  (same pattern as the EEG grid)
+//
+// The EMG bracelet prototype is expected to have 8–16 channels.  Using the
+// same compact grid as EEG keeps the two panels visually consistent and
+// avoids any layout issues when the channel count changes at runtime.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Rebuild the EMG channel-visibility grid inside #emgChannelList.
+ *
+ * Called when dual-stream mode is enabled or when the EMG channel count
+ * changes.  Uses the teal/green emgChannelColors palette so EMG cells are
+ * visually distinct from the EEG grid above.
+ */
+function buildEmgChannelSelectors() {
+  const container = document.getElementById('emgChannelList');
+  if (!container) return;
+  const enabled = getEmgEnabledChannels();
+
+  // Grow the visibility array to cover all palette slots
+  while (emgChannelVisibility.length < emgChannelColors.length) {
+    emgChannelVisibility.push(true);
+  }
+
+  // ── Bulk-control toolbar (same three buttons as EEG grid) ─────────────────
+  container.innerHTML = `
+    <div class="ch-grid-controls">
+      <button onclick="selectAllEmgChannels(true)"  title="Show all EMG channels">All</button>
+      <button onclick="selectAllEmgChannels(false)" title="Hide all EMG channels">None</button>
+      <button onclick="invertEmgChannelSelection()" title="Flip EMG channel visibility">Invert</button>
+    </div>
+    <div id="emgChGrid" class="ch-grid"></div>
+  `;
+
+  // ── Channel cells ──────────────────────────────────────────────────────────
+  const grid = container.querySelector('#emgChGrid');
+  for (let idx = 0; idx < enabled; idx++) {
+    const cell = document.createElement('div');
+    cell.className = 'ch-cell' + (emgChannelVisibility[idx] ? ' active' : '');
+    cell.textContent = idx + 1;
+    cell.title = `EMG Channel ${idx + 1} — click to toggle`;
+    cell.style.borderColor = emgChannelColors[idx] || '#aaa';
+    cell.dataset.index = idx;
+    cell.onclick = () => toggleEmgChannel(idx, cell);
+    grid.appendChild(cell);
+  }
+}
+
+/**
+ * Toggle a single EMG channel on or off.
+ *
+ * @param {number}  index  Zero-based channel index.
+ * @param {Element} cell   Grid cell DOM element.
+ */
+function toggleEmgChannel(index, cell) {
+  emgChannelVisibility[index] = !emgChannelVisibility[index];
+  if (cell) cell.classList.toggle('active', emgChannelVisibility[index]);
+  if (emgChart && emgChart.data.datasets[index]) {
+    emgChart.data.datasets[index].hidden = !emgChannelVisibility[index];
+    emgChart.update('none');
+  }
+}
+
+/**
+ * Show or hide all enabled EMG channels at once.
+ *
+ * @param {boolean} visible  true = show all, false = hide all.
+ */
+function selectAllEmgChannels(visible) {
+  const enabled = getEmgEnabledChannels();
+  for (let i = 0; i < enabled; i++) {
+    emgChannelVisibility[i] = visible;
+    if (emgChart && emgChart.data.datasets[i]) {
+      emgChart.data.datasets[i].hidden = !visible;
+    }
+  }
+  document.querySelectorAll('#emgChGrid .ch-cell').forEach((cell, i) => {
+    cell.classList.toggle('active', emgChannelVisibility[i]);
+  });
+  if (emgChart) emgChart.update('none');
+}
+
+/**
+ * Flip the visibility of every enabled EMG channel.
+ * Useful for quickly isolating one channel (None → click one)
+ * or comparing two groups of muscles.
+ */
+function invertEmgChannelSelection() {
+  const enabled = getEmgEnabledChannels();
+  for (let i = 0; i < enabled; i++) {
+    emgChannelVisibility[i] = !emgChannelVisibility[i];
+    if (emgChart && emgChart.data.datasets[i]) {
+      emgChart.data.datasets[i].hidden = !emgChannelVisibility[i];
+    }
+  }
+  document.querySelectorAll('#emgChGrid .ch-cell').forEach((cell, i) => {
+    cell.classList.toggle('active', emgChannelVisibility[i]);
+  });
+  if (emgChart) emgChart.update('none');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EMG data handler — called on every 'emg_data' Socket.IO event
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Receive a chunk of EMG data from the server and append it to the rolling
+ * waveform buffers, then re-render the EMG chart.
+ *
+ * Mirrors updateChart() for EEG but uses the separate emgWaveformBuffers and
+ * the emgChart instance so the two panels never interfere.
+ *
+ * @param {Object} data  Socket.IO payload:
+ *   { channels: number[][], sampling_rate: number, signal_type: 'emg', ... }
+ */
+function updateEmgChart(data) {
+  if (!emgChart || !data.channels || !Array.isArray(data.channels)) return;
+
+  const enabled = getEmgEnabledChannels();
+  const samplingRate = data.sampling_rate || 250;
+
+  // Resize buffer array if channel count changed at runtime
+  while (emgWaveformBuffers.length < emgChannelColors.length) emgWaveformBuffers.push([]);
+
+  // Build time-stamped sample arrays for each channel
+  const processedChannels = [];
+  data.channels.forEach((channelData, index) => {
+    if (index >= enabled || !Array.isArray(channelData)) return;
+    processedChannels[index] = channelData;
+  });
+
+  const chunkLength = Math.max(...processedChannels.map(ch => (Array.isArray(ch) ? ch.length : 0)), 0);
+  if (!chunkLength || samplingRate <= 0) return;
+
+  // Assign timestamps to each sample, continuing from the last known time
+  const times = Array.from({ length: chunkLength }, (_, i) =>
+    emgLastSampleTimestamp + (i + 1) / samplingRate
+  );
+  emgLastSampleTimestamp = times[times.length - 1];
+  const cutoff = Math.max(0, emgLastSampleTimestamp - waveformWindowSec);
+
+  // Append new samples and trim old ones outside the rolling window
+  processedChannels.forEach((series, index) => {
+    if (!Array.isArray(series) || index >= enabled) return;
+    const buffer = emgWaveformBuffers[index];
+    const count = Math.min(series.length, times.length);
+    for (let i = 0; i < count; i++) {
+      buffer.push({ x: times[i], y: series[i] });
+    }
+    while (buffer.length && buffer[0].x < cutoff) buffer.shift();
+  });
+
+  renderEmgWaveform();
+  updateEmgMetrics(processedChannels.slice(0, enabled));
+}
+
+/**
+ * Re-render the EMG chart from the current contents of emgWaveformBuffers.
+ * Called after every incoming data chunk and whenever display settings change.
+ */
+function renderEmgWaveform() {
+  if (!emgChart) return;
+  const enabled = getEmgEnabledChannels();
+
+  // Freeze-aware window calculation — mirrors the EEG panel logic exactly.
+  // When frozen, the window is anchored at freezePositionSec so both charts
+  // display the same time range and neither panel scrolls while paused.
+  // In live mode we use the bufferStart trick so that after a seek (or on
+  // fresh start) the signal fills left-to-right instead of appearing at the
+  // right edge of an otherwise empty chart.
+  let windowStart;
+  if (viewMode === 'freeze') {
+    windowStart = freezePositionSec;
+  } else {
+    let bufferStart = Infinity;
+    for (let i = 0; i < enabled; i++) {
+      const buf = emgWaveformBuffers[i];
+      if (buf && buf.length > 0 && buf[0].x < bufferStart) bufferStart = buf[0].x;
+    }
+    windowStart = bufferStart < Infinity
+      ? Math.max(bufferStart, emgLastSampleTimestamp - waveformWindowSec)
+      : Math.max(0, emgLastSampleTimestamp - waveformWindowSec);
+  }
+
+  // Compute per-channel vertical offsets for stacked mode
+  let offsets = [];
+  if (emgChartMode === 'stacked') {
+    const layout = computeEmgStackedLayout(enabled, windowStart);
+    offsets = layout.offsets;
+    emgStackedOffsets = offsets;
+    emgChart.options.scales.y.display = false;
+    emgChart.options.scales.y.min = layout.min;
+    emgChart.options.scales.y.max = layout.max;
+    emgChart.options.plugins.legend.display = false;
+    emgChart.options.layout = { padding: { left: 70, right: 10, top: 10, bottom: 10 } };
+  } else {
+    emgStackedOffsets = [];
+    emgChart.options.scales.y.display = true;
+    emgChart.options.scales.y.title.text = 'Amplitude (µV)';
+    emgChart.options.scales.y.min = -300;
+    emgChart.options.scales.y.max = 300;
+    emgChart.options.plugins.legend.display = true;
+    emgChart.options.layout = {};
+  }
+
+  emgChart.data.datasets.forEach((dataset, idx) => {
+    dataset.hidden = idx >= enabled ? true : !emgChannelVisibility[idx];
+    const buffer = emgWaveformBuffers[idx] || [];
+    const visiblePoints = buffer.filter(pt => pt.x >= windowStart);
+    const decimated = decimatePoints(visiblePoints, MAX_RENDER_POINTS);
+    dataset.data = emgChartMode === 'stacked'
+      ? decimated.map(pt => ({ x: pt.x - windowStart, y: pt.y + (offsets[idx] || 0) }))
+      : decimated.map(pt => ({ x: pt.x - windowStart, y: pt.y }));
+    dataset.borderWidth = emgChartMode === 'stacked' ? 1.2 : 1.5;
+  });
+
+  emgChart.options.scales.x.min = 0;
+  emgChart.options.scales.x.max = waveformWindowSec;
+  emgChart.update('none');
+}
+
+/**
+ * Compute vertical offsets for the stacked EMG layout.
+ * Uses the same algorithm as computeStackedLayout for EEG.
+ */
+function computeEmgStackedLayout(enabledChannels, windowStart) {
+  const defaultSpacing = 250;
+  let maxAbs = 0;
+
+  emgWaveformBuffers.slice(0, enabledChannels).forEach(buf => {
+    buf.forEach(pt => {
+      if (pt.x >= windowStart && Math.abs(pt.y) > maxAbs) maxAbs = Math.abs(pt.y);
+    });
+  });
+
+  const spacing = Math.max(defaultSpacing, maxAbs * 2.5 || defaultSpacing);
+  const mid = (enabledChannels - 1) / 2;
+  const offsets = emgChannelColors.map((_, idx) => (mid - idx) * spacing);
+
+  let minVal = Infinity, maxVal = -Infinity;
+  emgWaveformBuffers.slice(0, enabledChannels).forEach((buf, idx) => {
+    buf.forEach(pt => {
+      if (pt.x < windowStart) return;
+      const v = pt.y + offsets[idx];
+      if (v < minVal) minVal = v;
+      if (v > maxVal) maxVal = v;
+    });
+  });
+
+  if (!isFinite(minVal) || !isFinite(maxVal)) { minVal = -spacing; maxVal = spacing; }
+  const pad = spacing * 0.6;
+  return { offsets, min: minVal - pad, max: maxVal + pad };
+}
+
+/**
+ * Update the live EMG metrics cards (RMS and MAV averages across channels).
+ * These numbers give a quick indication of overall muscle activation level.
+ *
+ * @param {number[][]} channels  Array of per-channel sample arrays for the latest chunk.
+ */
+function updateEmgMetrics(channels) {
+  if (!channels || !channels.length) return;
+
+  let totalRms = 0, totalMav = 0, count = 0;
+  channels.forEach(ch => {
+    if (!Array.isArray(ch) || !ch.length) return;
+    const rms = Math.sqrt(ch.reduce((s, v) => s + v * v, 0) / ch.length);
+    const mav = ch.reduce((s, v) => s + Math.abs(v), 0) / ch.length;
+    totalRms += rms;
+    totalMav += mav;
+    count++;
+  });
+
+  if (count) {
+    setText('emgRms', `${(totalRms / count).toFixed(2)} µV`);
+    setText('emgMav', `${(totalMav / count).toFixed(2)} µV`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Socket.IO event handlers
+// ─────────────────────────────────────────────────────────────────────────────
 socket.on('connect', () => console.log('[client] Socket.IO connected'));
 socket.on('disconnect', () => console.log('[client] Socket.IO disconnected'));
 
 socket.on('analysis_stopped', () => {
   document.getElementById('startBtn').disabled = false;
   document.getElementById('stopBtn').disabled = true;
+  // Re-enable the dual-mode toggle so the user can change settings
+  const dualToggle = document.getElementById('dualModeToggle');
+  if (dualToggle) dualToggle.disabled = false;
+  // Hide the player bar — it only makes sense while a file is streaming
+  playerTeardown();
 });
 
+// ── File-replay socket events ─────────────────────────────────────────────────
+
+// Emitted once when the server starts replaying a file.
+// Shows the player bar and stores file duration / sampling rate.
+socket.on('playback_info', data => {
+  playerSetup(data);
+});
+
+// Emitted every ~100 ms during file replay to advance the scrubber.
+// Ignored while the user is dragging the scrubber thumb.
+socket.on('playback_progress', data => {
+  playerTick(data);
+});
+
+// Primary stream — drives the EEG chart panel
 socket.on('eeg_data', data => {
   updateChart(data);
 });
+
+// Secondary stream — drives the EMG chart panel in dual-stream mode.
+// The server only emits this event when dual_stream_mode is True.
+socket.on('emg_data', data => {
+  // Mirror the EEG Freeze behaviour — when the view is frozen, discard
+  // incoming EMG chunks so both panels stop updating at the same moment.
+  if (viewMode === 'freeze') return;
+  updateEmgChart(data);
+});
+
 
 function updateChart(data) {
   if (!chart || !data.channels || !Array.isArray(data.channels)) {
@@ -1231,7 +2154,34 @@ function renderWaveform() {
   if (!chart) return;
   const enabled = getEnabledChannels();
   syncWaveformBuffers(enabled);
-  const windowStart = Math.max(0, lastSampleTimestamp - waveformWindowSec);
+
+  // Compute the start of the visible window.
+  //
+  // Freeze mode: pinned at the timestamp when Freeze was clicked.
+  //
+  // Live mode:
+  //   Normally windowStart = lastSampleTimestamp - 8 s (trailing edge).
+  //   But after a seek (or at stream start) the buffer is almost empty, so
+  //   the first new sample would appear at the RIGHT edge and fill leftward —
+  //   the opposite of what feels natural.
+  //
+  //   Fix: find the oldest point currently in any buffer (bufferStart).
+  //   windowStart = max(bufferStart, lastSampleTimestamp - 8).
+  //   While the buffer spans < 8 s, bufferStart wins and data fills left→right.
+  //   Once the buffer is full the two terms are equal and it scrolls normally.
+  let windowStart;
+  if (viewMode === 'freeze') {
+    windowStart = freezePositionSec;
+  } else {
+    let bufferStart = Infinity;
+    for (let i = 0; i < enabled; i++) {
+      const buf = waveformBuffers[i];
+      if (buf.length > 0 && buf[0].x < bufferStart) bufferStart = buf[0].x;
+    }
+    windowStart = bufferStart < Infinity
+      ? Math.max(bufferStart, lastSampleTimestamp - waveformWindowSec)
+      : Math.max(0, lastSampleTimestamp - waveformWindowSec);
+  }
   currentWindowStartSec = windowStart;
   const layout = chartMode === 'stacked' ? computeStackedLayout(enabled, windowStart) : null;
   const offsets = chartMode === 'stacked' && layout ? layout.offsets : [];
