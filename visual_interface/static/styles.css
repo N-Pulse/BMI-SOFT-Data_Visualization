@@ -4,8 +4,8 @@ body {
   font-family: Arial, sans-serif;
 }
 .container {
-  width: 90%;
-  max-width: 1200px;
+  width: 96%;
+  max-width: 1800px;
   margin: auto;
   padding: 20px;
 }
@@ -180,7 +180,7 @@ input[type="range"] {
   left: 0;
   right: 0;
   bottom: 0;
-  background-color: #4CAF50;
+  background-color: #ff9800;  /* OFF = orange */
   transition: .4s;
   border-radius: 34px;
 }
@@ -198,7 +198,7 @@ input[type="range"] {
 }
 
 input:checked + .slider {
-  background-color: #ff9800;
+  background-color: #4CAF50;  /* ON = green */
 }
 
 input:checked + .slider:before {
