@@ -111,6 +111,17 @@ let playerTotalSec      = 0;
 let playerTotalSamples  = 0;
 let playerSamplingRate  = 250;
 let playerScrubDragging = false;  // suppress progress ticks while dragging
+// Channel names from the loaded file (e.g. ['FP1','FPZ','F7',...]).
+// Falls back to ['CH1','CH2',...] for files without metadata.
+let fileChannelNames    = [];
+
+// Vertical scale for the fixed-row stacked layout (µV shown in ±half a lane).
+// 0 = auto (median peak-to-peak of visible data).
+let eegVertScale = 100;
+
+// Per-channel RMS values computed during the last renderWaveform() call.
+// Read by the label plugin to show e.g. "13.5 µV" on the right of each row.
+let stackedRMS = [];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // EMG chart state (secondary panel — only active in dual-stream mode)
@@ -139,6 +150,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const modeSelect = document.getElementById('waveformModeSelect');
   if (modeSelect) chartMode = modeSelect.value || 'stacked';
+
+  // Show/hide vert-scale selector to match initial chart mode
+  const vertCtrl = document.getElementById('vertScaleControl');
+  if (vertCtrl) vertCtrl.style.display = chartMode === 'stacked' ? '' : 'none';
 
   // Ensure view-mode button state matches the JS default
   setViewMode('live');
@@ -341,6 +356,45 @@ function invertChannelSelection() {
   renderWaveform();
 }
 
+// Draws a thin horizontal separator line at the boundary between each channel
+// row, and a faint centre-line for each lane — mirrors the OpenBCI GUI grid.
+const rowSeparatorPlugin = {
+  id: 'rowSeparators',
+  afterDatasetsDraw(chartInstance) {
+    if (chartMode !== 'stacked') return;
+    const { ctx, chartArea, scales } = chartInstance;
+    if (!chartArea || !scales?.y) return;
+    const enabled = getEnabledChannels();
+    if (enabled < 2 || !stackedOffsets.length) return;
+
+    ctx.save();
+    ctx.lineWidth = 0.5;
+
+    // Centre-line per lane (very faint)
+    ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+    for (let i = 0; i < enabled; i++) {
+      const cy = scales.y.getPixelForValue(stackedOffsets[i] || 0);
+      ctx.beginPath();
+      ctx.moveTo(chartArea.left, cy);
+      ctx.lineTo(chartArea.right, cy);
+      ctx.stroke();
+    }
+
+    // Separator between rows (slightly brighter)
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    // Each separator sits midway between two adjacent channel centres
+    for (let i = 0; i < enabled - 1; i++) {
+      const mid = ((stackedOffsets[i] || 0) + (stackedOffsets[i + 1] || 0)) / 2;
+      const sy = scales.y.getPixelForValue(mid);
+      ctx.beginPath();
+      ctx.moveTo(chartArea.left, sy);
+      ctx.lineTo(chartArea.right, sy);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+};
+
 const stackedLabelPlugin = {
   id: 'stackedLabels',
   afterDatasetsDraw(chartInstance) {
@@ -348,9 +402,6 @@ const stackedLabelPlugin = {
     const { ctx, chartArea, scales } = chartInstance;
     if (!chartArea || !scales?.y) return;
     ctx.save();
-    ctx.fillStyle = '#cfd8dc';
-    ctx.font = '12px Arial';
-    ctx.textAlign = 'right';
     ctx.textBaseline = 'middle';
     const enabled = getEnabledChannels();
     for (let i = 0; i < enabled; i += 1) {
@@ -358,8 +409,27 @@ const stackedLabelPlugin = {
       if (!dataset || dataset.hidden) continue;
       const offset = stackedOffsets[i] || 0;
       const y = scales.y.getPixelForValue(offset);
-      const labelText = (dataset.label || `Ch ${i + 1}`).replace(/^[A-Z]+\s+/, '');
-      ctx.fillText(labelText, chartArea.left - 10, y);
+
+      // ── Left label: electrode name ──────────────────────────────────
+      // Use real electrode name from the file (e.g. "FP1") when available;
+      // fall back to the dataset label or a generic "Ch N" otherwise.
+      const labelText = fileChannelNames[i] || (dataset.label || `Ch ${i + 1}`).replace(/^[A-Z]+\s+/, '');
+      ctx.fillStyle = dataset.borderColor || '#cfd8dc';
+      ctx.font = 'bold 11px Arial';
+      ctx.textAlign = 'right';
+      ctx.fillText(labelText, chartArea.left - 6, y);
+
+      // ── Right label: RMS µV ─────────────────────────────────────────
+      const rmsVal = stackedRMS[i];
+      if (rmsVal != null && Number.isFinite(rmsVal)) {
+        const rmsText = rmsVal >= 1000
+          ? `${(rmsVal / 1000).toFixed(1)}mV`
+          : `${rmsVal.toFixed(0)}µV`;
+        ctx.fillStyle = 'rgba(180,180,180,0.75)';
+        ctx.font = '10px Arial';
+        ctx.textAlign = 'left';
+        ctx.fillText(rmsText, chartArea.right + 6, y);
+      }
     }
     ctx.restore();
   }
@@ -477,7 +547,7 @@ function buildChartOptions() {
     plugins: {
       legend: { display: chartMode === 'overlap', position: 'top' }
     },
-    layout: chartMode === 'stacked' ? { padding: { left: 70, right: 10, top: 10, bottom: 10 } } : {}
+    layout: chartMode === 'stacked' ? { padding: { left: 70, right: 70, top: 10, bottom: 10 } } : {}
   };
 }
 
@@ -506,9 +576,20 @@ function initializeChart() {
       }))
     },
     options: buildChartOptions(),
-    plugins: [stackedLabelPlugin, eventOverlayPlugin]
+    plugins: [rowSeparatorPlugin, stackedLabelPlugin, eventOverlayPlugin]
   });
   renderWaveform();
+
+  // Watch the resizable wrapper so Chart.js redraws at the new size whenever
+  // the user drags the bottom-right corner to change the panel height.
+  const wrap = document.getElementById('eegChartWrap');
+  if (wrap && window.ResizeObserver) {
+    if (window._eegResizeObserver) window._eegResizeObserver.disconnect();
+    window._eegResizeObserver = new ResizeObserver(() => {
+      if (chart) chart.resize();
+    });
+    window._eegResizeObserver.observe(wrap);
+  }
 }
 
 function initializeFeatureCharts() {
@@ -685,6 +766,9 @@ function setChartMode(mode) {
   if (select && select.value !== nextMode) {
     select.value = nextMode;
   }
+  // Show the vert-scale selector only in stacked mode
+  const vertCtrl = document.getElementById('vertScaleControl');
+  if (vertCtrl) vertCtrl.style.display = nextMode === 'stacked' ? '' : 'none';
   initializeChart();
 }
 
@@ -1448,6 +1532,30 @@ function playerSetup(info) {
   playerTotalSec     = info.total_time_sec || 0;
   playerSamplingRate = info.sampling_rate  || 250;
 
+  // Store real channel names so the stacked label plugin shows e.g. "FP1"
+  // instead of "Channel 1".  Falls back to generic names if not provided.
+  if (Array.isArray(info.channel_names) && info.channel_names.length > 0) {
+    fileChannelNames = info.channel_names;
+  } else {
+    fileChannelNames = [];
+  }
+
+  // Auto-configure the channel count to match what's actually in the file.
+  // Without this, the chart defaults to whatever was last set manually
+  // (e.g. 64), giving 64 empty lanes when the file only has 8 channels.
+  if (info.num_channels && info.num_channels > 0) {
+    const channelInput = document.getElementById('enabled_channels');
+    if (channelInput) {
+      channelInput.value = info.num_channels;
+      // Push the new count to the server so streaming is consistent
+      fetch('/update-settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled_channels: info.num_channels })
+      }).catch(err => console.warn('[playerSetup] Could not sync channel count:', err));
+    }
+  }
+
   const bar      = document.getElementById('playerBar');
   const scrubber = document.getElementById('playerScrubber');
   if (!bar || !scrubber) return;
@@ -1605,9 +1713,11 @@ function toggleDualMode() {
         // Build or rebuild the EMG chart with the current channel count
         buildEmgChannelSelectors();
         initializeEmgChart();
+        attachEmgResizeObserver();
       } else {
         // Clean up the Chart.js instance to free canvas memory
         if (emgChart) { emgChart.destroy(); emgChart = null; }
+        if (window._emgResizeObserver) { window._emgResizeObserver.disconnect(); }
         resetEmgWaveformBuffers();
       }
     })
@@ -1759,6 +1869,19 @@ const emgStackedLabelPlugin = {
 function setEmgChartMode(mode) {
   emgChartMode = mode === 'stacked' ? 'stacked' : 'overlap';
   initializeEmgChart();
+}
+
+// Wire up the EMG chart ResizeObserver so Chart.js redraws correctly
+// when the user drags the panel to a new height.
+// Called once after the EMG chart section becomes visible.
+function attachEmgResizeObserver() {
+  const wrap = document.getElementById('emgChartWrap');
+  if (!wrap || !window.ResizeObserver) return;
+  if (window._emgResizeObserver) window._emgResizeObserver.disconnect();
+  window._emgResizeObserver = new ResizeObserver(() => {
+    if (emgChart) emgChart.resize();
+  });
+  window._emgResizeObserver.observe(wrap);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1972,9 +2095,19 @@ function renderEmgWaveform() {
     const buffer = emgWaveformBuffers[idx] || [];
     const visiblePoints = buffer.filter(pt => pt.x >= windowStart);
     const decimated = decimatePoints(visiblePoints, MAX_RENDER_POINTS);
-    dataset.data = emgChartMode === 'stacked'
-      ? decimated.map(pt => ({ x: pt.x - windowStart, y: pt.y + (offsets[idx] || 0) }))
-      : decimated.map(pt => ({ x: pt.x - windowStart, y: pt.y }));
+
+    if (emgChartMode === 'stacked') {
+      // Mean-subtract to remove DC offset, same as the EEG stacked renderer.
+      const mean = visiblePoints.length
+        ? visiblePoints.reduce((s, p) => s + p.y, 0) / visiblePoints.length
+        : 0;
+      dataset.data = decimated.map(pt => ({
+        x: pt.x - windowStart,
+        y: (pt.y - mean) + (offsets[idx] || 0)
+      }));
+    } else {
+      dataset.data = decimated.map(pt => ({ x: pt.x - windowStart, y: pt.y }));
+    }
     dataset.borderWidth = emgChartMode === 'stacked' ? 1.2 : 1.5;
   });
 
@@ -1989,23 +2122,33 @@ function renderEmgWaveform() {
  */
 function computeEmgStackedLayout(enabledChannels, windowStart) {
   const defaultSpacing = 250;
-  let maxAbs = 0;
 
+  // Use peak-to-peak range per channel (same logic as computeStackedLayout for EEG)
+  // so DC offsets don't inflate the spacing and hide the actual muscle signal.
+  const channelRanges = [];
   emgWaveformBuffers.slice(0, enabledChannels).forEach(buf => {
-    buf.forEach(pt => {
-      if (pt.x >= windowStart && Math.abs(pt.y) > maxAbs) maxAbs = Math.abs(pt.y);
-    });
+    const pts = buf.filter(pt => pt.x >= windowStart);
+    if (pts.length < 2) return;
+    const ys = pts.map(p => p.y);
+    channelRanges.push(Math.max(...ys) - Math.min(...ys));
   });
+  channelRanges.sort((a, b) => a - b);
+  // Median is robust: a few noisy channels won't inflate spacing for all others.
+  const representativeRange = channelRanges.length
+    ? channelRanges[Math.floor(channelRanges.length * 0.5)]
+    : 0;
+  const spacing = Math.max(defaultSpacing, representativeRange * 1.5);
 
-  const spacing = Math.max(defaultSpacing, maxAbs * 2.5 || defaultSpacing);
   const mid = (enabledChannels - 1) / 2;
   const offsets = emgChannelColors.map((_, idx) => (mid - idx) * spacing);
 
   let minVal = Infinity, maxVal = -Infinity;
   emgWaveformBuffers.slice(0, enabledChannels).forEach((buf, idx) => {
-    buf.forEach(pt => {
-      if (pt.x < windowStart) return;
-      const v = pt.y + offsets[idx];
+    const pts = buf.filter(pt => pt.x >= windowStart);
+    if (!pts.length) return;
+    const mean = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+    pts.forEach(pt => {
+      const v = (pt.y - mean) + offsets[idx];
       if (v < minVal) minVal = v;
       if (v > maxVal) maxVal = v;
     });
@@ -2013,7 +2156,7 @@ function computeEmgStackedLayout(enabledChannels, windowStart) {
 
   if (!isFinite(minVal) || !isFinite(maxVal)) { minVal = -spacing; maxVal = spacing; }
   const pad = spacing * 0.6;
-  return { offsets, min: minVal - pad, max: maxVal + pad };
+  return { offsets, spacing, min: minVal - pad, max: maxVal + pad };
 }
 
 /**
@@ -2192,10 +2335,40 @@ function renderWaveform() {
     const buffer = waveformBuffers[idx] || [];
     const visiblePoints = buffer.filter(pt => pt.x >= windowStart);
     const decimatedPoints = decimatePoints(visiblePoints, MAX_RENDER_POINTS);
-    const renderPoints =
-      chartMode === 'stacked'
-        ? decimatedPoints.map(pt => ({ x: pt.x - windowStart, y: pt.y + (offsets[idx] || 0) }))
-        : decimatedPoints.map(pt => ({ x: pt.x - windowStart, y: pt.y }));
+
+    let renderPoints;
+    if (chartMode === 'stacked') {
+      // Per-channel DC-offset removal: subtract the mean of the visible window
+      // so electrode drift (can be thousands of µV in raw EEG) is centred at 0.
+      const mean = visiblePoints.length
+        ? visiblePoints.reduce((s, p) => s + p.y, 0) / visiblePoints.length
+        : 0;
+
+      // Fixed-scale normalisation (OpenBCI GUI style):
+      //   scaleFactor maps ±eegVertScale µV → ±45 % of the row height.
+      //   This way every channel occupies the same fixed pixel lane and the
+      //   amplitude display is fully determined by the vert-scale control.
+      const scaleFactor = layout ? (layout.spacing * 0.45) / layout.vertScale : 1;
+
+      // Hard-clip at ±half the row height so a badly noisy channel (e.g. AF3,
+      // P6) clips at the lane boundary rather than overwriting its neighbours.
+      const rowClip = layout ? layout.spacing * 0.5 : Infinity;
+      const off = offsets[idx] || 0;
+
+      // Compute per-channel RMS of the (DC-removed) visible window for the
+      // right-side label.
+      const rms = visiblePoints.length
+        ? Math.sqrt(visiblePoints.reduce((s, p) => s + (p.y - mean) ** 2, 0) / visiblePoints.length)
+        : 0;
+      stackedRMS[idx] = rms;
+
+      renderPoints = decimatedPoints.map(pt => {
+        const y = (pt.y - mean) * scaleFactor;
+        return { x: pt.x - windowStart, y: Math.max(-rowClip, Math.min(rowClip, y)) + off };
+      });
+    } else {
+      renderPoints = decimatedPoints.map(pt => ({ x: pt.x - windowStart, y: pt.y }));
+    }
     dataset.data = renderPoints;
     dataset.borderWidth = chartMode === 'stacked' ? 1.2 : 1.6;
   });
@@ -2207,7 +2380,7 @@ function renderWaveform() {
     chart.options.scales.y.min = layout.min;
     chart.options.scales.y.max = layout.max;
     chart.options.plugins.legend.display = false;
-    chart.options.layout = { padding: { left: 70, right: 10, top: 10, bottom: 10 } };
+    chart.options.layout = { padding: { left: 70, right: 70, top: 10, bottom: 10 } };
   } else {
     const range = getYAxisRange();
     chart.options.scales.y.display = true;
@@ -2236,39 +2409,48 @@ function decimatePoints(points, maxPoints) {
   return reduced;
 }
 
+/**
+ * Fixed equal-row stacked layout — every channel gets the same lane height,
+ * independent of signal amplitude.  Mirrors the OpenBCI GUI "Time Series" view.
+ *
+ * `eegVertScale` (µV) controls what amplitude fills ±half a lane:
+ *   eegVertScale = 100  →  ±100 µV fills the lane (default)
+ *   eegVertScale = 0    →  Auto: derive scale from the median channel range
+ */
 function computeStackedLayout(enabledChannels, windowStart) {
-  const defaultSpacing = getDefaultStackSpacing();
-  let maxAbs = 0;
-  waveformBuffers.slice(0, enabledChannels).forEach(buf => {
-    buf.forEach(pt => {
-      if (pt.x >= windowStart) {
-        const absVal = Math.abs(pt.y);
-        if (absVal > maxAbs) maxAbs = absVal;
-      }
+  let vertScale = eegVertScale;
+
+  if (vertScale === 0) {
+    // Auto mode: use median peak-to-peak / 2 across channels so a typical
+    // signal fills the row without noise outliers dominating the scale.
+    const halfRanges = [];
+    waveformBuffers.slice(0, enabledChannels).forEach(buf => {
+      const pts = buf.filter(pt => pt.x >= windowStart);
+      if (pts.length < 2) return;
+      const ys = pts.map(p => p.y);
+      halfRanges.push((Math.max(...ys) - Math.min(...ys)) / 2);
     });
-  });
-
-  const spacing = Math.max(defaultSpacing, maxAbs * 2.5 || defaultSpacing);
-  const mid = (enabledChannels - 1) / 2;
-  const offsets = channelColors.map((_, idx) => (mid - idx) * spacing);
-
-  let minVal = Number.POSITIVE_INFINITY;
-  let maxVal = Number.NEGATIVE_INFINITY;
-  waveformBuffers.slice(0, enabledChannels).forEach((buf, idx) => {
-    buf.forEach(pt => {
-      if (pt.x < windowStart) return;
-      const shifted = pt.y + offsets[idx];
-      if (shifted < minVal) minVal = shifted;
-      if (shifted > maxVal) maxVal = shifted;
-    });
-  });
-
-  if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) {
-    minVal = -spacing;
-    maxVal = spacing;
+    halfRanges.sort((a, b) => a - b);
+    vertScale = halfRanges.length
+      ? Math.max(10, halfRanges[Math.floor(halfRanges.length * 0.5)])
+      : 100;
   }
-  const pad = spacing * 0.6;
-  return { offsets, min: minVal - pad, max: maxVal + pad };
+
+  // rowSpacing is the centre-to-centre distance between adjacent channels in
+  // chart data coordinates.  Making it 2.4× vertScale means the visible signal
+  // (±vertScale µV, shown at 90% fill) fits inside the row with small margins.
+  const rowSpacing = vertScale * 2.4;
+  const mid = (enabledChannels - 1) / 2;
+  const offsets = channelColors.map((_, idx) => (mid - idx) * rowSpacing);
+
+  const halfTotal = mid * rowSpacing;
+  const pad = rowSpacing * 0.55;
+  return { offsets, spacing: rowSpacing, vertScale, min: -halfTotal - pad, max: halfTotal + pad };
+}
+
+function setVertScale(value) {
+  eegVertScale = parseFloat(value) || 0;
+  renderWaveform();
 }
 
 function getDefaultStackSpacing() {
