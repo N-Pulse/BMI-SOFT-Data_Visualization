@@ -322,6 +322,18 @@
                         <option value="stacked" selected>EEG stacked</option>
                     </select>
                 </div>
+                <div class="waveform-mode" id="vertScaleControl">
+                    <label for="vertScaleSelect">Scale</label>
+                    <select id="vertScaleSelect" onchange="setVertScale(this.value)" title="Vertical scale: amplitude that fills ±half of each channel lane">
+                        <option value="0">Auto</option>
+                        <option value="25">±25 µV</option>
+                        <option value="50">±50 µV</option>
+                        <option value="100" selected>±100 µV</option>
+                        <option value="200">±200 µV</option>
+                        <option value="500">±500 µV</option>
+                        <option value="1000">±1000 µV</option>
+                    </select>
+                </div>
                 <!-- View mode: Live = auto-scroll, Freeze = chart paused for analysis.
                      In file-replay mode Freeze also pauses the server stream,
                      so Resume continues from exactly where you stopped. -->
@@ -331,7 +343,9 @@
                 </div>
                 <div id="qualityOverlay" class="quality-overlay">Quality Alert: Signal quality low</div>
             </div>
-            <canvas id="eegChart"></canvas>
+            <div class="chart-resize-wrap" id="eegChartWrap">
+                <canvas id="eegChart"></canvas>
+            </div>
 
             <!-- ── File-replay player bar ────────────────────────────────────
                  Shown only when a file has been loaded for replay.
@@ -379,7 +393,9 @@
             </div>
 
             <!-- The canvas that Chart.js renders the EMG waveforms into -->
-            <canvas id="emgChart"></canvas>
+            <div class="chart-resize-wrap" id="emgChartWrap">
+                <canvas id="emgChart"></canvas>
+            </div>
 
             <!-- Per-channel visibility toggles for the EMG panel.
                  Click a pill to hide/show that channel — same as the EEG panel. -->
