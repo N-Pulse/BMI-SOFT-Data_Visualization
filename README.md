@@ -33,7 +33,7 @@ socketio.run(app, host='0.0.0.0', port=5001, debug=False)
 PY
 ```
 
-Then open **http://127.0.0.1:5001** in your browser.
+Then open **http://127.0.0.1:5001** or **http://10.177.207.36:5001/** (recommended) in your browser.
 
 ---
 
