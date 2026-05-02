@@ -199,25 +199,6 @@ Creates `sample_eeg_data.json` in the project root. Upload it under Simulation M
 
 ---
 
-## DSI-24 via LSL (hardware mode)
-
-1. Start the DSI bridge application that publishes the LSL stream
-2. In the UI: set Simulation Mode **OFF**, Signal Type **EEG**, Hardware Source **DSI via LSL**
-3. Click **Start Stream**
-
-Optional environment variables for stream matching:
-
-```bash
-DSI_LSL_TYPE=EEG          # stream type to search for (default: EEG)
-DSI_LSL_NAME=DSI-24       # stream name filter (default: any)
-DSI_LSL_TIMEOUT=10        # seconds to wait for the stream (default: 8)
-```
-
-Example:
-```bash
-DSI_LSL_TYPE=EEG DSI_LSL_NAME=DSI-24 DSI_LSL_TIMEOUT=10 python app.py
-```
-
 ---
 
 ## Troubleshooting
