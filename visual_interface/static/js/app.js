@@ -1680,17 +1680,8 @@ function toggleDualMode() {
   const toggle = document.getElementById('dualModeToggle');
   const hardwareMsg = document.getElementById('dualModeHardwareMsg');
 
-  // Dual-stream is simulation-only for now — the hardware EMG bracelet
-  // integration is not yet wired up on the server side.  If the user tries
-  // to enable the toggle in hardware mode, revert it immediately and show
-  // a clear inline message instead of silently producing a blank EMG panel.
-  if (toggle.checked && !isSimulationMode) {
-    toggle.checked = false;          // revert the visual state
-    if (hardwareMsg) hardwareMsg.style.display = '';
-    return;
-  }
-  // Hide the hardware-mode warning whenever the toggle is turned off or
-  // the user is already in simulation mode.
+  // Hardware dual-stream is supported through the Arduino/Chords serial EMG
+  // backend. Hide the old simulation-only warning if it exists.
   if (hardwareMsg) hardwareMsg.style.display = 'none';
 
   isDualStreamMode = toggle.checked;

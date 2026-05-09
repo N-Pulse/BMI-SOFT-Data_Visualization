@@ -12,6 +12,7 @@ A Flask + Socket.IO web interface for streaming, visualizing, and recording EEG/
   pip install -r requirements.txt
   ```
 - *Optional:* BrainFlow-compatible hardware (PiEEG) for real EEG acquisition
+- *Optional:* Arduino UNO R4 Minima running the Chords firmware for real EMG acquisition
 - *Optional:* `pylsl` for DSI-24 streaming via LSL
 
 ---
@@ -44,10 +45,10 @@ At the top of the interface, select what signal you want to work with:
 | Button | What it does |
 |--------|-------------|
 | **EEG** | Streams EEG data (hardware, simulation, or file replay) |
-| **EMG** | Streams EMG data (simulation only for now) |
+| **EMG** | Streams EMG data from simulation, file replay, or Arduino/Chords hardware |
 | **Motion** | Streams motion/accelerometer data |
 
-**Synchronized EEG + EMG** toggle (below the signal buttons): runs both EEG and EMG simultaneously, showing two independent chart panels. Green = both streams active, Orange = only one stream.
+**Synchronized EEG + EMG** toggle (below the signal buttons): runs both EEG and EMG simultaneously, showing two independent chart panels. In hardware mode, EEG uses the selected EEG backend and EMG uses the Arduino/Chords serial backend. Green = both streams active, Orange = only one stream.
 
 ---
 
@@ -60,6 +61,7 @@ Toggle **Simulation Mode** on or off in the Source Settings section.
 - Set **Hardware Source** to:
   - `BrainFlow / PiEEG` — reads a BrainFlow-compatible board connected via USB/SPI
   - `DSI via LSL` — reads the first matching LSL EEG stream from a DSI-24 headset
+- For EMG hardware, connect the Arduino UNO R4 flashed with the Chords firmware. The backend reads the USB serial stream directly.
 
 ### Simulation ON — synthetic or file replay
 
@@ -187,6 +189,37 @@ Toggle **Synchronized EEG + EMG** to stream both signals simultaneously:
 - Set the number of EMG channels (1–16) in the field that appears when the toggle is on
 - Both streams can be recorded and exported independently
 
+## Live EMG from Arduino / Chords
+
+For the Kraken EMG setup, connect the Arduino UNO R4 Minima over USB and make sure the Chords firmware is already uploaded. The firmware streams 6 analog channels at 500 Hz using binary packets over serial.
+
+Recommended UI settings:
+
+| Setting | Value |
+|---------|-------|
+| Signal | **EMG** |
+| Simulation Mode | **OFF** |
+| Channels | `6` |
+
+Then click **Start Stream**.
+
+If the Arduino is not auto-detected, launch the server with the port set manually:
+
+```bash
+export EMG_SERIAL_PORT=/dev/ttyACM0
+cd visual_interface
+./run_local.sh
+```
+
+On Linux, if the port exists but cannot be opened, add your user to the serial-port group:
+
+```bash
+sudo usermod -a -G dialout $USER
+newgrp dialout
+```
+
+Close the Chords web visualizer and Arduino Serial Monitor before starting the app. Only one program can read the serial port at a time.
+
 ---
 
 ## Generating test data
@@ -208,6 +241,7 @@ Creates `sample_eeg_data.json` in the project root. Upload it under Simulation M
 | Chart is blank after Start Stream | Is Simulation Mode on? Is a file loaded if you expect file replay? Check the terminal for errors. |
 | Scrubber does not appear | Only shown during file replay — upload a `.fif`/`.edf`/`.xdf`/`.json` file and start the stream |
 | Signal freezes immediately | Check if **⏸ Freeze** is active — click **Live** to resume |
-| Hardware not detected | Check USB/SPI connection, BrainFlow board ID setting, or LSL bridge status |
+| Hardware not detected | Check USB/SPI connection, BrainFlow board ID setting, LSL bridge status, or Arduino serial port |
 | High noise / poor quality | Run **Calibrate**, enable **Baseline Correction** and **Notch filter** in signal processing settings |
 | `pylsl` import error | Requires Python < 3.14; use a Python 3.12 virtual environment for DSI mode |
+| EMG serial error | Close Chords/Arduino Serial Monitor, check `/dev/ttyACM0`, install `pyserial`, or set `EMG_SERIAL_PORT` manually |
