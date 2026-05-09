@@ -136,6 +136,19 @@ hardware_source = "pieeg"  # pieeg | dsi_lsl
 lsl_stream_type = os.environ.get("DSI_LSL_TYPE", "EEG")
 lsl_stream_name = os.environ.get("DSI_LSL_NAME", "")
 lsl_resolve_timeout = float(os.environ.get("DSI_LSL_TIMEOUT", "8"))
+
+# EMG hardware backend: Upside Down Labs Chords firmware on Arduino UNO R4.
+# Leave EMG_SERIAL_PORT empty to auto-detect (/dev/ttyACM*, COM*, etc.).
+emg_serial_port = os.environ.get("EMG_SERIAL_PORT", "").strip()
+emg_baud_rate = int(os.environ.get("EMG_BAUD_RATE", "230400"))
+emg_sampling_rate = float(os.environ.get("EMG_SAMPLING_RATE", "500"))
+emg_chords_channels = int(os.environ.get("EMG_CHANNELS", "6"))
+CHORDS_SYNC_BYTE_1 = 0xC7
+CHORDS_SYNC_BYTE_2 = 0x7C
+CHORDS_END_BYTE = 0x01
+CHORDS_HEADER_LEN = 3
+CHORDS_PACKET_LEN = CHORDS_HEADER_LEN + (emg_chords_channels * 2) + 1
+CHORDS_ADC_MIDPOINT = float(os.environ.get("EMG_ADC_MIDPOINT", "8192"))  # UNO R4 uses 14-bit ADC in the Chords sketch
 recording_active = False
 recording_paused = False
 recording_data = []
@@ -261,6 +274,72 @@ def check_gpio_conflicts():
 def compute_chunk_size(sampling_rate):
     """Return samples per ~100 ms chunk"""
     return max(1, int(sampling_rate * 0.1))
+
+
+def find_emg_serial_port():
+    """Return the configured or auto-detected Arduino/Chords serial port."""
+    if emg_serial_port:
+        return emg_serial_port
+
+    try:
+        from serial.tools import list_ports
+    except ImportError as exc:
+        raise RuntimeError("pyserial is required for EMG hardware mode. Install it with: pip install pyserial") from exc
+
+    ports = list(list_ports.comports())
+    if not ports:
+        raise RuntimeError("No serial ports found. Plug in the Arduino UNO R4 and check that it appears as /dev/ttyACM* or COM*.")
+
+    # Prefer Arduino/UNO R4-looking ports, otherwise fall back to the first ACM/USB/COM port.
+    keywords = ("arduino", "uno", "r4", "renesas", "usb serial", "acm", "ch340")
+    for port in ports:
+        haystack = " ".join(str(x or "") for x in (port.device, port.description, port.manufacturer, port.product)).lower()
+        if any(k in haystack for k in keywords):
+            return port.device
+
+    for port in ports:
+        dev = str(port.device)
+        if dev.startswith(("/dev/ttyACM", "/dev/ttyUSB", "COM")):
+            return dev
+
+    available = ", ".join(p.device for p in ports)
+    raise RuntimeError(f"Could not auto-detect Arduino serial port. Available ports: {available}. Set EMG_SERIAL_PORT manually.")
+
+
+def read_chords_packet(ser):
+    """Read one binary packet emitted by the Chords UNO-R4 firmware.
+
+    Packet format: 0xC7 0x7C counter [ch1_hi ch1_lo ... ch6_hi ch6_lo] 0x01.
+    Returns a list of uint16 ADC values, or None on timeout.
+    """
+    while running:
+        first = ser.read(1)
+        if not first:
+            return None
+        if first[0] != CHORDS_SYNC_BYTE_1:
+            continue
+
+        second = ser.read(1)
+        if not second:
+            return None
+        if second[0] != CHORDS_SYNC_BYTE_2:
+            continue
+
+        rest = ser.read(CHORDS_PACKET_LEN - 2)
+        if len(rest) != CHORDS_PACKET_LEN - 2:
+            return None
+
+        packet = bytes([CHORDS_SYNC_BYTE_1, CHORDS_SYNC_BYTE_2]) + rest
+        if packet[-1] != CHORDS_END_BYTE:
+            # Bad alignment; continue scanning until the next sync bytes.
+            continue
+
+        values = []
+        for ch in range(emg_chords_channels):
+            idx = CHORDS_HEADER_LEN + 2 * ch
+            values.append((packet[idx] << 8) | packet[idx + 1])
+        return values
+    return None
 
 def update_filter_coefficients(sampling_rate):
     """Pre-compute filter coefficients based on current settings and sampling rate"""
@@ -1833,6 +1912,87 @@ def read_emg_data_dual_simulation():
         socketio.emit('error', {'message': f"Dual EMG simulation error: {str(e)}"})
 
 
+def read_emg_data_chords_serial(dual_stream=False):
+    """Read live EMG from the Arduino UNO R4 running the Chords firmware.
+
+    In single-stream mode it emits the data through the main chart event.
+    In dual-stream mode it emits through 'emg_data', so EEG and EMG can be shown
+    side-by-side in the existing frontend.
+    """
+    global running, current_stream_sampling_rate
+    ser = None
+    port = None
+    try:
+        import serial
+
+        port = find_emg_serial_port()
+        logging.info("Opening EMG Arduino serial port %s @ %s baud", port, emg_baud_rate)
+        ser = serial.Serial(port, emg_baud_rate, timeout=1)
+
+        # UNO R4 native USB can reset when the serial port opens.
+        time.sleep(2.0)
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        ser.write(b"START\n")
+        ser.flush()
+
+        hw_rate = float(emg_sampling_rate)
+        update_filter_coefficients(hw_rate)
+        current_stream_sampling_rate = hw_rate / downsample_factor if downsample_factor > 0 else hw_rate
+        samples_per_chunk = compute_chunk_size(hw_rate)
+        channel_count = emg_enabled_channels if dual_stream else enabled_channels
+        channel_count = max(1, min(int(channel_count), emg_chords_channels))
+        chunk = [[] for _ in range(channel_count)]
+
+        logging.info(
+            "EMG Chords stream started: %s channels @ %.1f Hz, chunk=%s samples",
+            channel_count, hw_rate, samples_per_chunk
+        )
+
+        while running and (not dual_stream or dual_stream_mode):
+            values = read_chords_packet(ser)
+            if values is None:
+                continue
+
+            # Keep only the channels displayed in the UI. The firmware sends uint16
+            # 14-bit ADC counts, normally centered around Vcc/2; subtracting 8192
+            # makes the waveform zero-centered and easier to visualize as EMG.
+            for idx in range(channel_count):
+                chunk[idx].append(float(values[idx]) - CHORDS_ADC_MIDPOINT)
+
+            if len(chunk[0]) >= samples_per_chunk:
+                data_transposed = np.asarray(chunk, dtype=np.float32)
+                process_and_emit_chunk(
+                    data_transposed,
+                    hw_rate,
+                    acquisition_ts=time.time(),
+                    signal_type='emg'
+                )
+                chunk = [[] for _ in range(channel_count)]
+
+    except Exception as e:
+        logging.error("EMG Chords serial error: %s", e)
+        running = False
+        socketio.emit('error', {'message': f"EMG Chords serial error: {str(e)}"})
+    finally:
+        if ser is not None:
+            try:
+                ser.write(b"STOP\n")
+                ser.flush()
+            except Exception:
+                pass
+            try:
+                ser.close()
+            except Exception:
+                pass
+        logging.info("EMG Chords serial stream stopped%s", f" ({port})" if port else "")
+
+
+def read_emg_data_chords_serial_dual():
+    """Wrapper used by Socket.IO for the secondary EMG hardware thread."""
+    read_emg_data_chords_serial(dual_stream=True)
+
+
 def read_eeg_data_brainflow():
     """Read EEG data from BrainFlow and emit to frontend"""
     global collected_data, running, current_stream_sampling_rate
@@ -2370,11 +2530,16 @@ def start_analysis():
             else:
                 target = read_eeg_data_simulation
     else:
-        if current_signal_type in ('emg', 'motion'):
-            logging.warning(f"{current_signal_type.upper()} hardware mode not supported yet")
-            return jsonify({"status": f"{current_signal_type.upper()} hardware mode is not supported. Enable simulation mode."}), 400
+        if current_signal_type == 'motion':
+            logging.warning("MOTION hardware mode not supported yet")
+            return jsonify({"status": "MOTION hardware mode is not supported. Enable simulation mode."}), 400
 
-        if hardware_source == "dsi_lsl":
+        if current_signal_type == 'emg':
+            if dual_stream_mode:
+                return jsonify({"status": "error", "message": "For dual-stream hardware mode, select EEG as the main signal and enable Synchronized EEG + EMG. For EMG only, disable dual-stream."}), 400
+            logging.info("Starting analysis in HARDWARE mode (EMG via Arduino/Chords serial)")
+            target = read_emg_data_chords_serial
+        elif hardware_source == "dsi_lsl":
             try:
                 info = _resolve_lsl_eeg_stream()
                 logging.info(
@@ -2410,17 +2575,17 @@ def start_analysis():
 
         # In dual-stream mode, launch a second independent EMG thread so both
         # EEG and EMG data flow to the browser at the same time.
-        # Currently only available in simulation mode; hardware support will be
-        # added once the N-Pulse EMG bracelet communication protocol is confirmed.
-        if dual_stream_mode and simulation_mode:
+        if dual_stream_mode:
             with emg_collected_data_lock:
                 # Reset the EMG buffer to match the new number of channels
                 global emg_collected_data
                 emg_collected_data = [[] for _ in range(emg_enabled_channels)]
-            socketio.start_background_task(read_emg_data_dual_simulation)
-            logging.info(
-                "Dual-stream EMG thread started (%s channels)", emg_enabled_channels
-            )
+            if simulation_mode:
+                socketio.start_background_task(read_emg_data_dual_simulation)
+                logging.info("Dual-stream EMG simulation thread started (%s channels)", emg_enabled_channels)
+            else:
+                socketio.start_background_task(read_emg_data_chords_serial_dual)
+                logging.info("Dual-stream EMG hardware thread started (%s channels)", emg_enabled_channels)
 
     except Exception as exc:
         running = False

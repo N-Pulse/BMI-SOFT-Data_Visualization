@@ -8,3 +8,4 @@ edfio>=0.4
 brainflow>=5.21
 pyxdf>=1.16
 pylsl>=1.18.2; python_version >= "3.9"
+pyserial>=3.5

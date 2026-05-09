@@ -7,6 +7,7 @@ The app is built with **Flask + Socket.IO** and supports:
 - synthetic EEG/EMG simulation,
 - file replay from recorded sessions,
 - live EEG acquisition through BrainFlow / PiEEG,
+- live EMG acquisition from an Arduino UNO R4 Minima running the Upside Down Labs Chords firmware,
 - DSI EEG streaming through Lab Streaming Layer,
 - BIDS-style recording/export.
 
@@ -144,6 +145,48 @@ Use this mode when the DSI headset is streamed through Lab Streaming Layer.
 
 Make sure the DSI-to-LSL bridge is running first, then start the visual interface and select the DSI/LSL source in the UI.
 
+### Arduino UNO R4 / Chords EMG
+
+Use this mode for the Kraken EMG setup based on the Arduino UNO R4 Minima and the Upside Down Labs Chords firmware. The Arduino must be flashed with the Chords sketch that sends 6 analog channels at 500 Hz over USB serial at 230400 baud.
+
+Before launching the app, connect the Arduino over USB and make sure no other program is using the same serial port. Do not keep the Chords web visualizer open at the same time, because only one program can read the Arduino serial stream.
+
+On Linux, check the detected port with:
+
+```bash
+ls /dev/ttyACM* /dev/ttyUSB*
+```
+
+If needed, give your user access to serial ports:
+
+```bash
+sudo usermod -a -G dialout $USER
+newgrp dialout
+```
+
+Then launch the app and select:
+
+```text
+Signal: EMG
+Simulation Mode: OFF
+Channels: 6
+```
+
+Click **Start Stream** to visualize the live EMG signals.
+
+The backend auto-detects the Arduino port. To force a specific port, set:
+
+```bash
+export EMG_SERIAL_PORT=/dev/ttyACM0
+export EMG_BAUD_RATE=230400
+export EMG_SAMPLING_RATE=500
+export EMG_CHANNELS=6
+cd visual_interface
+./run_local.sh
+```
+
+For simultaneous EEG + EMG visualization, select EEG as the main signal, keep hardware mode enabled, enable **Synchronized EEG + EMG**, and connect the Arduino for the EMG stream.
+
 ---
 
 ## Troubleshooting
@@ -217,6 +260,22 @@ python -c "from brainflow.board_shim import BoardShim; print('BrainFlow OK')"
 ### LSL / pylsl errors
 
 DSI mode requires Lab Streaming Layer to be available and the DSI LSL stream to be running. Simulation mode does not require LSL.
+
+### EMG serial errors
+
+If EMG hardware mode does not start, check that:
+
+- the Arduino UNO R4 is connected and flashed with the Chords firmware,
+- the Chords web visualizer and Arduino Serial Monitor are closed,
+- the detected port exists, for example `/dev/ttyACM0`,
+- your Linux user belongs to the `dialout` group,
+- `pyserial` is installed in the active virtual environment.
+
+You can force the port manually:
+
+```bash
+export EMG_SERIAL_PORT=/dev/ttyACM0
+```
 
 ---
 
