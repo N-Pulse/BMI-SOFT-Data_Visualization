@@ -1,1 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / editor files
 .DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Local data / generated outputs
+visual_interface/bids_output/
+visual_interface/sample_eeg_data.json
+visual_interface/sample_emg_data.json
+visual_interface/uploads/
+visual_interface/exports/
+*.edf
+*.fif
+*.xdf
+
+# Temporary files
+tmp/
+temp/
+*.tmp

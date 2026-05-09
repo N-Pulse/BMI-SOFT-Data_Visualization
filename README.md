@@ -1,213 +1,269 @@
-# N-Pulse Visual Interface — User Guide
+# N-Pulse BMI Visual Interface
 
-A Flask + Socket.IO web interface for streaming, visualizing, and recording EEG/EMG biosignals in real time. Supports live hardware, synthetic simulation, and file replay from recorded sessions.
+Real-time web interface for visualizing, streaming, replaying, and recording EEG/EMG biosignals.
 
----
+The app is built with **Flask + Socket.IO** and supports:
 
-## Prerequisites
+- synthetic EEG/EMG simulation,
+- file replay from recorded sessions,
+- live EEG acquisition through BrainFlow / PiEEG,
+- DSI EEG streaming through Lab Streaming Layer,
+- BIDS-style recording/export.
 
-- Python 3.10+
-- Virtual environment with all dependencies installed:
-  ```bash
-  pip install -r requirements.txt
-  ```
-- *Optional:* BrainFlow-compatible hardware (PiEEG) for real EEG acquisition
-- *Optional:* `pylsl` for DSI-24 streaming via LSL
-
----
-
-## Starting the server
-
-Run from the project root (keep this terminal open while using the interface):
+The main application is located in:
 
 ```bash
-FLASK_ENV=development FLASK_APP=app.py flask run --debug --no-reload
+visual_interface/
 ```
 
-Or launch directly with Socket.IO:
+---
+
+## Quick start
+
+Clone the repository:
 
 ```bash
-python - <<'PY'
-from app import app, socketio
-socketio.run(app, host='0.0.0.0', port=5001, debug=False)
-PY
+git clone <repo-url>
+cd BMI-SOFT-Data_Visualization
 ```
 
-Then open **http://127.0.0.1:5001** or **http://10.177.207.36:5001/** (recommended) in your browser.
+Launch the app:
+
+```bash
+cd visual_interface
+./run_local.sh
+```
+
+Then open:
+
+```text
+http://127.0.0.1:5001
+```
+
+The script automatically creates a virtual environment at the repository root, installs the dependencies, and starts the Flask-SocketIO server.
 
 ---
 
-## Signal type
+## Manual setup
 
-At the top of the interface, select what signal you want to work with:
+If you prefer to run the setup manually:
 
-| Button | What it does |
-|--------|-------------|
-| **EEG** | Streams EEG data (hardware, simulation, or file replay) |
-| **EMG** | Streams EMG data (simulation only for now) |
-| **Motion** | Streams motion/accelerometer data |
+```bash
+cd BMI-SOFT-Data_Visualization
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r visual_interface/requirements.txt
+```
 
-**Synchronized EEG + EMG** toggle (below the signal buttons): runs both EEG and EMG simultaneously, showing two independent chart panels. Green = both streams active, Orange = only one stream.
+Then launch:
 
----
+```bash
+cd visual_interface
+PORT=5001 python app.py
+```
 
-## Hardware vs Simulation mode
+Open:
 
-Toggle **Simulation Mode** on or off in the Source Settings section.
-
-### Simulation OFF — live hardware
-
-- Set **Hardware Source** to:
-  - `BrainFlow / PiEEG` — reads a BrainFlow-compatible board connected via USB/SPI
-  - `DSI via LSL` — reads the first matching LSL EEG stream from a DSI-24 headset
-
-### Simulation ON — synthetic or file replay
-
-- **No file uploaded** → synthetic waveforms are generated on the fly (useful for UI testing without hardware)
-- **File uploaded** → replays the recorded file through the same pipeline as live data
-
-#### Uploading a recording file
-
-Supported formats: `.fif`, `.edf`, `.xdf`, `.json`
-
-Two ways to load:
-
-1. **Single file** — click *Choose file* and select your signal file, then optionally upload a matching `events.tsv`
-2. **Session folder** — click *Upload session folder* and select an entire BIDS-like folder (the interface auto-detects the signal file, `events.tsv`, `events.json`, and `channels.tsv`)
+```text
+http://127.0.0.1:5001
+```
 
 ---
 
-## Streaming — step by step
+## First test without hardware
 
-1. Choose signal type and hardware/simulation source
-2. Set the number of **channels** (up to 64 for EEG, 16 for EMG)
-3. *(Optional)* Adjust filter and signal processing settings
-4. Click **Start Stream**
-5. Click **Stop Stream** when done
+The easiest way to verify the app is working is to use simulation mode.
 
----
+1. Open the web interface.
+2. Enable **Simulation Mode**.
+3. Select **EEG**.
+4. Choose a number of channels, for example `8`.
+5. Click **Start Stream**.
 
-## Waveform display
-
-### Display modes
-
-Select from the **Display** dropdown in the waveform panel header:
-
-| Mode | Description |
-|------|-------------|
-| **EEG stacked** *(default)* | Each channel on its own baseline — best for comparing signal shapes and event timing across channels |
-| **Overlap** | All channels share one y-axis — useful for quick amplitude comparison |
-
-### Live vs Freeze
-
-Two buttons sit next to the Display selector:
-
-| Button | Behaviour |
-|--------|-----------|
-| **Live** | Chart auto-scrolls to show the most recent 8 seconds of signal |
-| **⏸ Freeze** | Chart stops updating at the current moment so you can analyse it. For file replay this also pauses the server — no data is missed. Click **Live** to resume from exactly where you stopped. |
-
-### File replay scrubber
-
-When replaying a `.fif` / `.edf` / `.xdf` / `.json` file, a timeline scrubber appears below the chart:
-
-- The thumb advances automatically as the file plays
-- **Drag the thumb** to jump to any position in the file — the chart clears and refills from the new position within ~100 ms
-- Scrubbing automatically switches back to **Live** mode so you see the signal immediately
+You should see synthetic EEG traces updating live.
 
 ---
 
-## Channel selection
+## Generate sample data
 
-Below the waveform, a compact grid shows all enabled channels. Each cell is coloured to match its trace on the chart.
-
-- **Click a cell** to show/hide that channel
-- **All / None / Invert** buttons for bulk selection
-
-The same grid is shown for the EMG panel when dual-stream mode is active.
-
----
-
-## Calibration
-
-Click **Calibrate** to measure the DC baseline of each channel over 5 seconds.
-
-The per-channel offsets are stored and subtracted from incoming data whenever **Baseline Correction** is enabled in the signal processing settings. This removes electrode drift and DC bias that can push traces off screen or saturate the amplifier's range.
-
-> Run calibration at the start of each session, before the participant begins any task. In simulation mode, synthetic baselines are generated automatically.
-
----
-
-## Recording to BIDS
-
-The **Recording Controls** section lets you save data in BIDS-compliant format.
-
-1. Fill in **Subject**, **Session**, **Task**, **Run**, and **Modality** fields
-2. Click **Start Recording** — data collection starts alongside the live stream
-3. *(Optional)* Click **Pause** / resume mid-session
-4. Click **Stop & Save** — the interface writes:
-   - `_eeg.edf` (or `_emg.edf`) — raw signal in EDF format
-   - `_eeg.json` — metadata sidecar
-   - `_channels.tsv` — channel list
-   - `_events.tsv` — event markers
-
-### Adding event markers
-
-During a recording, type a label in the **Marker label** field (e.g. `grip`, `rest`, `blink`) and click **Add Marker**. Each marker is timestamped and saved to `_events.tsv`.
-
----
-
-## Exporting the buffer
-
-Click **Export Buffer** to download the current in-memory data buffer (independent of a formal recording). Exports as CSV or as a BIDS-compliant EDF inside a ZIP archive.
-
----
-
-## Live metrics
-
-The **Live Metrics** panel shows real-time signal quality indicators:
-
-| Metric | Meaning |
-|--------|---------|
-| **Avg Power** | Mean signal power across all channels (µV²) |
-| **Muscle Activation** | RMS amplitude — proxy for muscle activity in EMG mode |
-| **SNR** | Estimated signal-to-noise ratio |
-| **Channel Quality** | 0–100 % score derived from SNR; a warning appears on the chart if quality drops below 35 % |
-
-The **band-power chart** and **feature time chart** below the metrics update every 400 ms with spectral features (delta, theta, alpha, beta, gamma bands).
-
----
-
-## Synchronized EEG + EMG (dual-stream)
-
-Toggle **Synchronized EEG + EMG** to stream both signals simultaneously:
-
-- EEG appears in the main waveform panel
-- EMG appears in a second panel below with its own channel grid and RMS/MAV metrics
-- Set the number of EMG channels (1–16) in the field that appears when the toggle is on
-- Both streams can be recorded and exported independently
-
----
-
-## Generating test data
+From `visual_interface/`:
 
 ```bash
 python scripts/generate_sample_eeg.py
 ```
 
-Creates `sample_eeg_data.json` in the project root. Upload it under Simulation Mode → file replay to test the full pipeline without hardware.
+This creates a sample JSON recording that can be loaded in the interface using Simulation Mode + file replay.
+
+For EMG sample data:
+
+```bash
+python scripts/generate_sample_emg.py
+```
 
 ---
+
+## Repository structure
+
+```text
+BMI-SOFT-Data_Visualization/
+├── README.md                     # Main setup and launch instructions
+├── docs/
+│   └── USER_GUIDE.md             # Detailed interface usage guide
+├── eeg_realtime/                 # Small earlier EEG demo app
+└── visual_interface/             # Main N-Pulse visual interface
+    ├── app.py                    # Flask + Socket.IO backend
+    ├── requirements.txt          # Python dependencies
+    ├── run_local.sh              # Recommended local launcher
+    ├── scripts/                  # Test data generation scripts
+    ├── static/                   # Frontend JavaScript and CSS
+    └── templates/                # HTML templates
+```
+
+---
+
+## Hardware modes
+
+The app can be launched without hardware. Hardware-specific libraries are loaded only when the corresponding mode is used.
+
+### BrainFlow / PiEEG
+
+Use this mode for BrainFlow-compatible EEG boards.
+
+If needed, set the serial/SPI device before launch:
+
+```bash
+export PIEEG_SERIAL_PORT=/dev/spidev0.0
+cd visual_interface
+./run_local.sh
+```
+
+### DSI via LSL
+
+Use this mode when the DSI headset is streamed through Lab Streaming Layer.
+
+Make sure the DSI-to-LSL bridge is running first, then start the visual interface and select the DSI/LSL source in the UI.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Check |
-|---------|-------|
-| Chart is blank after Start Stream | Is Simulation Mode on? Is a file loaded if you expect file replay? Check the terminal for errors. |
-| Scrubber does not appear | Only shown during file replay — upload a `.fif`/`.edf`/`.xdf`/`.json` file and start the stream |
-| Signal freezes immediately | Check if **⏸ Freeze** is active — click **Live** to resume |
-| Hardware not detected | Check USB/SPI connection, BrainFlow board ID setting, or LSL bridge status |
-| High noise / poor quality | Run **Calibrate**, enable **Baseline Correction** and **Notch filter** in signal processing settings |
-| `pylsl` import error | Requires Python < 3.14; use a Python 3.12 virtual environment for DSI mode |
+### `python: command not found`
+
+Use:
+
+```bash
+python3 --version
+```
+
+If Python exists but `python` does not, recreate the virtual environment:
+
+```bash
+cd BMI-SOFT-Data_Visualization
+rm -rf .venv
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r visual_interface/requirements.txt
+```
+
+### Port 5001 is already in use
+
+Find the process:
+
+```bash
+lsof -i :5001
+```
+
+Kill it:
+
+```bash
+kill -9 <PID>
+```
+
+Or launch on another port:
+
+```bash
+cd visual_interface
+PORT=5002 ./run_local.sh
+```
+
+Then open:
+
+```text
+http://127.0.0.1:5002
+```
+
+### The app starts but the chart is blank
+
+Check:
+
+- Simulation Mode is enabled if no hardware is connected.
+- A file is uploaded if you expect file replay.
+- The terminal does not show backend errors.
+- You clicked **Start Stream**.
+
+### BrainFlow import errors
+
+The app should still launch in Simulation Mode even if BrainFlow has an issue. BrainFlow is only required for live BrainFlow/PiEEG acquisition.
+
+Test BrainFlow separately:
+
+```bash
+source .venv/bin/activate
+python -c "from brainflow.board_shim import BoardShim; print('BrainFlow OK')"
+```
+
+### LSL / pylsl errors
+
+DSI mode requires Lab Streaming Layer to be available and the DSI LSL stream to be running. Simulation mode does not require LSL.
+
+---
+
+## Development workflow
+
+Create a branch before modifying the app:
+
+```bash
+git switch -c my-feature-branch
+```
+
+Run the app locally:
+
+```bash
+cd visual_interface
+./run_local.sh
+```
+
+Before committing, check what changed:
+
+```bash
+git status
+git diff
+```
+
+Commit:
+
+```bash
+git add .
+git commit -m "Describe the change"
+```
+
+Push:
+
+```bash
+git push -u origin my-feature-branch
+```
+
+---
+
+## Main entry point
+
+Use this command for local development:
+
+```bash
+cd visual_interface
+./run_local.sh
+```
+
+Avoid using `flask run` directly unless the app has been explicitly refactored for that workflow. The Socket.IO server should be started through `app.py` or `run_local.sh`.
