@@ -111,7 +111,6 @@ BMI-SOFT-Data_Visualization/
 ├── README.md                     # Main setup and launch instructions
 ├── docs/
 │   └── USER_GUIDE.md             # Detailed interface usage guide
-├── eeg_realtime/                 # Small earlier EEG demo app
 └── visual_interface/             # Main N-Pulse visual interface
     ├── app.py                    # Flask + Socket.IO backend
     ├── requirements.txt          # Python dependencies
