@@ -1,247 +1,130 @@
-# N-Pulse Visual Interface — User Guide
+# User guide
 
-A Flask + Socket.IO web interface for streaming, visualizing, and recording EEG/EMG biosignals in real time. Supports live hardware, synthetic simulation, and file replay from recorded sessions.
+How to use the interface once it is running. To start it, see the [Quick start](../README.md#quick-start).
 
----
+## Pick a source
 
-## Prerequisites
+| I want to… | Signal | Mode switch | Also |
+|---|---|---|---|
+| Try the interface | EEG · EMG · Motion | **Simulation** | – |
+| Replay a recording | any | **Simulation** | upload a session folder or a file |
+| Record from the **EMG bracelet** | **EMG** | **Hardware** | Arduino plugged in, *Enabled Channels* = 6 |
+| Record EEG from a PiEEG board | EEG | **Hardware** | Raspberry Pi with the PiEEG shield |
+| Show EEG and EMG together | EEG + **Synchronized EEG + EMG** | either | [see below](#eeg-and-emg-together) |
 
-- Python 3.10+
-- Virtual environment with all dependencies installed:
-  ```bash
-  pip install -r requirements.txt
-  ```
-- *Optional:* BrainFlow-compatible hardware (PiEEG) for real EEG acquisition
-- *Optional:* Arduino UNO R4 Minima running the Chords firmware for real EMG acquisition
-- *Optional:* `pylsl` for DSI-24 streaming via LSL
+The DSI-24 headset is not in the table because the page cannot select it yet: see [DSI-24](#dsi-24-headset-via-lsl).
 
----
+**No recording at hand?** `python scripts/generate_sample_eeg.py` (or `generate_sample_emg.py`) writes a sample `.json` into the folder you run it from. Upload it to try file replay.
 
-## Starting the server
+**Replaying:** *Upload Session Folder* is the easy way, since it picks up the signal, `events.tsv`, `events.json` and `channels.tsv` on its own. The alternative is *Upload EEG/EMG Data File*, optionally with *Upload Events File*. The app can replay its own recordings.
 
-Run from the project root (keep this terminal open while using the interface):
+## Stream
+
+1. Choose the signal and the source (above).
+2. Set **Enabled Channels**, up to 64. The bracelet sends 6.
+3. Optional: **Signal Processing**. Baseline Correction is on by default; Bandpass Filter and Smoothing are off. EEG always gets a 50/60 Hz notch, EMG never does.
+4. **Start Stream**, then **Stop Stream**.
+
+## Read the screen
+
+| Control | What it does |
+|---|---|
+| **Display**: EEG stacked / Overlap | one lane per channel, or all channels on one axis |
+| **Scale**: Auto, ±25 … ±1000 µV | the amplitude that fills a lane (default ±100 µV) |
+| **Live** / **⏸ Freeze** | follow the newest 8 s, or stop the chart. In file replay, Freeze pauses the file too |
+| Scrubber *(file replay only)* | drag to jump anywhere in the file |
+| Channel grid | click a cell to hide or show a channel · **All** / **None** / **Invert** |
+| **Calibrate** | measures each channel's DC offset for 5 s; it is subtracted while **Baseline Correction** is on |
+| **Export Buffer** | downloads what is in memory (CSV or EDF), no recording needed |
+| **Live Metrics** | Avg Power · Muscle Activation (RMS) · SNR · Channel Quality, which warns below 35 %. The charts below show mean power and δ θ α β γ band power |
+
+## EEG and EMG together
+
+Switch on **Synchronized EEG + EMG**. A second panel appears for EMG, with its own **EMG Channels** box (1–16), channel grid and RMS / MAV.
+
+![EEG and EMG panels streaming side by side](images/dual-stream.png)
+
+## Record
+
+1. Fill **Subject · Session · Task · Run** and pick the **Modality**. It must match the signal you are streaming.
+2. Open **Edit Metadata** and check it. The rows are defaults, not facts: write down the electrode placement, and note that the device rows (*Manufacturer*, *Model*, *Communication Protocol*, *Institution*) still say PiEEG, so change them for bracelet sessions.
+3. **Start Recording**, then **Add Marker** (a label and an optional description) whenever something happens, then **Stop & Save**. **Pause** pauses and resumes.
+
+The files land in `visual_interface/bids_output/` on the machine running the server (git-ignored), and the browser downloads the same files as `sub-<id>_task-<task>_run-<run>_recording.zip`.
+
+| File | Contains |
+|---|---|
+| `…_emg.edf` · `…_eeg.edf` | the signal |
+| `…_emg.json` · `…_eeg.json` | sidecar: sampling rate, channel count, filters, electrode placement |
+| `…_channels.tsv` | channel names, type, units |
+| `…_events.tsv` | markers: onset, duration, label |
+| `dataset_description.json` | written once at the top of `bids_output/`; BIDS requires it |
+
+> ⚠️ **What is saved is processed, not raw.** Everything you switch on under Signal Processing is applied before the data is recorded, and no raw copy is kept. The sidecar's `SoftwareFilters` lists what was on when you pressed **Stop & Save**, so do not change the processing mid-recording.
+>
+> ⚠️ **Markers from the button have no duration.** They are written as `n/a` in `events.tsv`, never as a fake `0`. A duration needs the API: `POST /add-marker` when the movement starts and `POST /end-marker` when it ends. A cued protocol that does this on a timer is the next feature to build ([known limitations](ARCHITECTURE.md#known-limitations)).
+>
+> ⚠️ **Recordings are personal data.** `bids_output/` is git-ignored. Never commit or share it outside the ethics-approved workflow.
+
+## Hardware setup
+
+### EMG bracelet
+
+The Arduino UNO R4 runs the Upside Down Labs **Chords** sketch: 6 analog channels at 500 Hz over USB serial at 230400 baud.
+
+1. Plug it in and close every other program that reads the port (the Chords web visualiser, the Arduino Serial Monitor). Only one program can read it.
+2. Select **EMG**, leave the mode switch on **Hardware**, set **Enabled Channels** to 6, press **Start Stream**.
+
+The port is found automatically. To force one, set variables before launching:
 
 ```bash
-FLASK_ENV=development FLASK_APP=app.py flask run --debug --no-reload
-```
-
-Or launch directly with Socket.IO:
-
-```bash
-python - <<'PY'
-from app import app, socketio
-socketio.run(app, host='0.0.0.0', port=5001, debug=False)
-PY
-```
-
-Then open **http://127.0.0.1:5001** or **http://10.177.207.36:5001/** (recommended) in your browser.
-
----
-
-## Signal type
-
-At the top of the interface, select what signal you want to work with:
-
-| Button | What it does |
-|--------|-------------|
-| **EEG** | Streams EEG data (hardware, simulation, or file replay) |
-| **EMG** | Streams EMG data from simulation, file replay, or Arduino/Chords hardware |
-| **Motion** | Streams motion/accelerometer data |
-
-**Synchronized EEG + EMG** toggle (below the signal buttons): runs both EEG and EMG simultaneously, showing two independent chart panels. In hardware mode, EEG uses the selected EEG backend and EMG uses the Arduino/Chords serial backend. Green = both streams active, Orange = only one stream.
-
----
-
-## Hardware vs Simulation mode
-
-Toggle **Simulation Mode** on or off in the Source Settings section.
-
-### Simulation OFF — live hardware
-
-- Set **Hardware Source** to:
-  - `BrainFlow / PiEEG` — reads a BrainFlow-compatible board connected via USB/SPI
-  - `DSI via LSL` — reads the first matching LSL EEG stream from a DSI-24 headset
-- For EMG hardware, connect the Arduino UNO R4 flashed with the Chords firmware. The backend reads the USB serial stream directly.
-
-### Simulation ON — synthetic or file replay
-
-- **No file uploaded** → synthetic waveforms are generated on the fly (useful for UI testing without hardware)
-- **File uploaded** → replays the recorded file through the same pipeline as live data
-
-#### Uploading a recording file
-
-Supported formats: `.fif`, `.edf`, `.xdf`, `.json`
-
-Two ways to load:
-
-1. **Single file** — click *Choose file* and select your signal file, then optionally upload a matching `events.tsv`
-2. **Session folder** — click *Upload session folder* and select an entire BIDS-like folder (the interface auto-detects the signal file, `events.tsv`, `events.json`, and `channels.tsv`)
-
----
-
-## Streaming — step by step
-
-1. Choose signal type and hardware/simulation source
-2. Set the number of **channels** (up to 64 for EEG, 16 for EMG)
-3. *(Optional)* Adjust filter and signal processing settings
-4. Click **Start Stream**
-5. Click **Stop Stream** when done
-
----
-
-## Waveform display
-
-### Display modes
-
-Select from the **Display** dropdown in the waveform panel header:
-
-| Mode | Description |
-|------|-------------|
-| **EEG stacked** *(default)* | Each channel on its own baseline — best for comparing signal shapes and event timing across channels |
-| **Overlap** | All channels share one y-axis — useful for quick amplitude comparison |
-
-### Live vs Freeze
-
-Two buttons sit next to the Display selector:
-
-| Button | Behaviour |
-|--------|-----------|
-| **Live** | Chart auto-scrolls to show the most recent 8 seconds of signal |
-| **⏸ Freeze** | Chart stops updating at the current moment so you can analyse it. For file replay this also pauses the server — no data is missed. Click **Live** to resume from exactly where you stopped. |
-
-### File replay scrubber
-
-When replaying a `.fif` / `.edf` / `.xdf` / `.json` file, a timeline scrubber appears below the chart:
-
-- The thumb advances automatically as the file plays
-- **Drag the thumb** to jump to any position in the file — the chart clears and refills from the new position within ~100 ms
-- Scrubbing automatically switches back to **Live** mode so you see the signal immediately
-
----
-
-## Channel selection
-
-Below the waveform, a compact grid shows all enabled channels. Each cell is coloured to match its trace on the chart.
-
-- **Click a cell** to show/hide that channel
-- **All / None / Invert** buttons for bulk selection
-
-The same grid is shown for the EMG panel when dual-stream mode is active.
-
----
-
-## Calibration
-
-Click **Calibrate** to measure the DC baseline of each channel over 5 seconds.
-
-The per-channel offsets are stored and subtracted from incoming data whenever **Baseline Correction** is enabled in the signal processing settings. This removes electrode drift and DC bias that can push traces off screen or saturate the amplifier's range.
-
-> Run calibration at the start of each session, before the participant begins any task. In simulation mode, synthetic baselines are generated automatically.
-
----
-
-## Recording to BIDS
-
-The **Recording Controls** section lets you save data in BIDS-compliant format.
-
-1. Fill in **Subject**, **Session**, **Task**, **Run**, and **Modality** fields
-2. Click **Start Recording** — data collection starts alongside the live stream
-3. *(Optional)* Click **Pause** / resume mid-session
-4. Click **Stop & Save** — the interface writes:
-   - `_eeg.edf` (or `_emg.edf`) — raw signal in EDF format
-   - `_eeg.json` — metadata sidecar
-   - `_channels.tsv` — channel list
-   - `_events.tsv` — event markers
-
-### Adding event markers
-
-During a recording, type a label in the **Marker label** field (e.g. `grip`, `rest`, `blink`) and click **Add Marker**. Each marker is timestamped and saved to `_events.tsv`.
-
----
-
-## Exporting the buffer
-
-Click **Export Buffer** to download the current in-memory data buffer (independent of a formal recording). Exports as CSV or as a BIDS-compliant EDF inside a ZIP archive.
-
----
-
-## Live metrics
-
-The **Live Metrics** panel shows real-time signal quality indicators:
-
-| Metric | Meaning |
-|--------|---------|
-| **Avg Power** | Mean signal power across all channels (µV²) |
-| **Muscle Activation** | RMS amplitude — proxy for muscle activity in EMG mode |
-| **SNR** | Estimated signal-to-noise ratio |
-| **Channel Quality** | 0–100 % score derived from SNR; a warning appears on the chart if quality drops below 35 % |
-
-The **band-power chart** and **feature time chart** below the metrics update every 400 ms with spectral features (delta, theta, alpha, beta, gamma bands).
-
----
-
-## Synchronized EEG + EMG (dual-stream)
-
-Toggle **Synchronized EEG + EMG** to stream both signals simultaneously:
-
-- EEG appears in the main waveform panel
-- EMG appears in a second panel below with its own channel grid and RMS/MAV metrics
-- Set the number of EMG channels (1–16) in the field that appears when the toggle is on
-- Both streams can be recorded and exported independently
-
-## Live EMG from Arduino / Chords
-
-For the Kraken EMG setup, connect the Arduino UNO R4 Minima over USB and make sure the Chords firmware is already uploaded. The firmware streams 6 analog channels at 500 Hz using binary packets over serial.
-
-Recommended UI settings:
-
-| Setting | Value |
-|---------|-------|
-| Signal | **EMG** |
-| Simulation Mode | **OFF** |
-| Channels | `6` |
-
-Then click **Start Stream**.
-
-If the Arduino is not auto-detected, launch the server with the port set manually:
-
-```bash
-export EMG_SERIAL_PORT=/dev/ttyACM0
-cd visual_interface
+export EMG_SERIAL_PORT=/dev/cu.usbmodem1101    # macOS · /dev/ttyACM0 on Linux · COM3 on Windows
+export EMG_BAUD_RATE=230400 EMG_SAMPLING_RATE=500 EMG_CHANNELS=6
 ./run_local.sh
 ```
 
-On Linux, if the port exists but cannot be opened, add your user to the serial-port group:
+Find the port with `ls /dev/cu.usbmodem*` (macOS) or `ls /dev/ttyACM*` (Linux). On Linux, "permission denied" is fixed by `sudo usermod -a -G dialout $USER` and logging in again.
+
+> ⚠️ **The values are the Arduino's raw 14-bit ADC counts, zero-centred, not µV**, although the charts, `channels.tsv` and the EDF say µV. Use **Scale → Auto**. The *Sampling Rate* box is ignored for the bracelet; `EMG_SAMPLING_RATE` decides.
+
+### DSI-24 headset (via LSL)
+
+Start the DSI-to-LSL bridge first so the stream exists. The backend can read it, but **the page has no control to select it**, so it cannot be started from the browser yet. Until a dropdown exists, choose it through the API while the stream is stopped:
 
 ```bash
-sudo usermod -a -G dialout $USER
-newgrp dialout
+curl -X POST http://127.0.0.1:5001/set-hardware-source \
+     -H 'Content-Type: application/json' -d '{"hardware_source": "dsi_lsl"}'
 ```
 
-Close the Chords web visualizer and Arduino Serial Monitor before starting the app. Only one program can read the serial port at a time.
+Then select **EEG**, keep the mode switch on **Hardware** and press **Start Stream**. The choice lasts until the server restarts. If the bridge is not running you get *DSI LSL stream is not ready*. Optional variables: `DSI_LSL_TYPE` (default `EEG`) · `DSI_LSL_NAME` (default any) · `DSI_LSL_TIMEOUT` (default 8 s). This was checked through the API only; nobody has connected a real headset yet.
 
----
+### PiEEG
 
-## Generating test data
+Hardware mode with **EEG**, on a Raspberry Pi with the PiEEG shield. `PIEEG_SERIAL_PORT` (default `/dev/spidev0.0`) sets the SPI device. **REF Enabled** and **BIASOUT Enabled** in Channel Settings are PiEEG electrode settings.
 
-```bash
-python scripts/generate_sample_eeg.py
-```
+## Manual setup
 
-Creates `sample_eeg_data.json` in the project root. Upload it under Simulation Mode → file replay to test the full pipeline without hardware.
+`run_local.sh` does this for you. Without bash, from the repository root:
 
----
+| | macOS / Linux | Windows *(untested)* |
+|---|---|---|
+| Create the environment | `python3 -m venv .venv` | `py -m venv .venv` |
+| Activate it | `source .venv/bin/activate` | `.venv\Scripts\activate` |
+| Install | `pip install -r visual_interface/requirements.txt` | same |
+| Run | `cd visual_interface && python app.py` | same |
 
----
+`PORT=5002 python app.py` changes the port (on Windows, `set PORT=5002` first).
 
 ## Troubleshooting
 
-| Symptom | Check |
-|---------|-------|
-| Chart is blank after Start Stream | Is Simulation Mode on? Is a file loaded if you expect file replay? Check the terminal for errors. |
-| Scrubber does not appear | Only shown during file replay — upload a `.fif`/`.edf`/`.xdf`/`.json` file and start the stream |
-| Signal freezes immediately | Check if **⏸ Freeze** is active — click **Live** to resume |
-| Hardware not detected | Check USB/SPI connection, BrainFlow board ID setting, LSL bridge status, or Arduino serial port |
-| High noise / poor quality | Run **Calibrate**, enable **Baseline Correction** and **Notch filter** in signal processing settings |
-| `pylsl` import error | Requires Python < 3.14; use a Python 3.12 virtual environment for DSI mode |
-| EMG serial error | Close Chords/Arduino Serial Monitor, check `/dev/ttyACM0`, install `pyserial`, or set `EMG_SERIAL_PORT` manually |
+| Symptom | Fix |
+|---|---|
+| Page opens but the chart stays empty and the metrics show `--` | No internet: Chart.js and Socket.IO load from CDNs. Reconnect and reload. |
+| Chart empty after **Start Stream** | Is the mode switch right? Is a file loaded if you expect replay? Read the terminal. |
+| `Permission denied` on `./run_local.sh` | `chmod +x visual_interface/run_local.sh` |
+| Port 5001 is busy | `PORT=5002 ./run_local.sh` |
+| EMG: *No serial ports found* or *Could not auto-detect* | Check the USB cable, close other programs using the port, or set `EMG_SERIAL_PORT` |
+| Signal freezes | **⏸ Freeze** is on. Click **Live**. |
+| No scrubber | It only appears in file replay. |
+| Noisy signal | **Calibrate**, then turn on **Baseline Correction**. |
+| `ImportError` | Run `./run_local.sh` again: it re-checks the dependencies on every start. |

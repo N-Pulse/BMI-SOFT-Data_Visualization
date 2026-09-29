@@ -411,6 +411,69 @@ def apply_filters(data_transposed, sampling_rate, signal_type=None):
                     logging.error(f"Notch filtering failed: {e}")
     return data_transposed
 
+
+def describe_software_filters(signal_type=None):
+    """Describe every processing step that was applied before data was saved.
+
+    IMPORTANT for anyone training a decoder on these recordings:
+    the recording buffer is fed from process_and_emit_chunk(), which filters,
+    baseline-corrects, smooths and downsamples *before* anything reaches disk.
+    The saved EDF therefore contains processed data, not raw samples, and no
+    raw copy is kept.  This function reports exactly what was done, so the
+    sidecar never claims the file is unprocessed when it isn't.
+
+    Returns a dict describing each active stage, or "n/a" if nothing was applied.
+    """
+    sig = signal_type if signal_type is not None else current_signal_type
+    filters = {}
+
+    if bandpass_enabled:
+        filters["Bandpass filter"] = {
+            "type": "Butterworth, zero-phase (filtfilt)",
+            "lower cutoff (Hz)": lowcut,
+            "upper cutoff (Hz)": highcut,
+            "order": order
+        }
+    # The notch is applied to EEG only — see apply_filters().
+    if sig == 'eeg':
+        filters["Notch filter"] = {
+            "type": "IIR notch, zero-phase (filtfilt)",
+            "frequencies (Hz)": [50, 60],
+            "quality factor": 30
+        }
+    if baseline_correction_enabled:
+        filters["Baseline correction"] = (
+            "Per-channel DC offset subtracted, measured by /calibrate"
+        )
+    if smoothing_enabled:
+        filters["Smoothing"] = {"type": "Moving average", "window (samples)": 3}
+    if downsample_factor and int(downsample_factor) > 1:
+        filters["Downsampling"] = {"factor": int(downsample_factor)}
+
+    return filters or "n/a"
+
+
+def software_versions_string():
+    """Report the package versions actually installed, not a hard-coded string."""
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+    except ImportError:
+        return "unknown"
+
+    parts = []
+    for package, label in (
+        ("numpy", "NumPy"),
+        ("scipy", "SciPy"),
+        ("mne", "MNE-Python"),
+        ("brainflow", "BrainFlow"),
+    ):
+        try:
+            parts.append(f"{label} {version(package)}")
+        except PackageNotFoundError:
+            continue
+    return ", ".join(parts) if parts else "unknown"
+
+
 def apply_smoothing(data_transposed, window=3):
     """Optional moving average smoothing"""
     if not smoothing_enabled or window <= 1:
@@ -744,13 +807,28 @@ def reset_recording_state():
         recording_sampling_rate = current_stream_sampling_rate
 
 def create_events_tsv(events):
-    """Create BIDS-friendly events.tsv content from recorded markers"""
+    """Create BIDS events.tsv content from recorded markers.
+
+    `duration` is written as "n/a" when a marker has no measured extent, which
+    BIDS permits and which is the honest answer.  A hard-coded 0 would claim
+    every event was instantaneous, and a decoder cannot learn from that: to
+    train a gesture classifier you need to know which *window* of signal the
+    gesture covered, not just when someone pressed a button.
+
+    Give a marker a real duration either by sending `duration` to /add-marker,
+    or by calling /end-marker when the movement finishes.
+    """
     lines = ["onset\tduration\ttrial_type\tdescription\n"]
     for evt in events:
         onset = evt.get('offset', 0)
         label = evt.get('label', 'marker')
         description = evt.get('description', '')
-        lines.append(f"{onset:.3f}\t0\t{label}\t{description}\n")
+        duration = evt.get('duration')
+        if isinstance(duration, (int, float)) and duration >= 0:
+            duration_str = f"{duration:.3f}"
+        else:
+            duration_str = "n/a"
+        lines.append(f"{onset:.3f}\t{duration_str}\t{label}\t{description}\n")
     return "".join(lines)
 
 def reset_qc_stats():
@@ -772,8 +850,46 @@ def bids_cache_key(subject_id, session_id, task, run, modality):
     return f"sub-{subject_id}_ses-{session_id}_task-{task}_run-{run}_{modality}"
 
 
+def ensure_dataset_description():
+    """Write dataset_description.json at the BIDS root if it is missing.
+
+    This file is REQUIRED by BIDS: without it the folder is not a valid
+    dataset and bids-validator rejects it outright, no matter how correct
+    the recordings inside are.  It is written once and then left alone, so
+    anyone can edit the authors or licence by hand without it being
+    overwritten on the next recording.
+    """
+    os.makedirs(BIDS_ROOT, exist_ok=True)
+    path = os.path.join(BIDS_ROOT, "dataset_description.json")
+    if os.path.exists(path):
+        return path
+
+    description = {
+        "Name": "N-Pulse BMI biosignal recordings",
+        "BIDSVersion": "1.11.0",
+        "DatasetType": "raw",
+        "License": "CC-BY-4.0",
+        "Authors": ["EPFL N-Pulse"],
+        "Acknowledgements": "Recorded with the N-Pulse visual interface.",
+        "HowToAcknowledge": "Please cite the EPFL N-Pulse association.",
+        "GeneratedBy": [{
+            "Name": "N-Pulse visual interface",
+            "Description": "Flask + Socket.IO acquisition, visualisation and BIDS export tool."
+        }]
+    }
+    try:
+        with open(path, "w") as f:
+            json.dump(description, f, indent=2)
+        logging.info("Created %s", path)
+    except Exception as exc:
+        # A missing description must not abort an ongoing recording.
+        logging.error("Could not write dataset_description.json: %s", exc)
+    return path
+
+
 def ensure_bids_dirs(subject_id, session_id, modality):
     """Ensure BIDS directory structure exists"""
+    ensure_dataset_description()
     modality_folder = BIDS_MODALITY_FOLDERS.get(modality, modality)
     modality_dir = os.path.join(
         BIDS_ROOT,
@@ -834,7 +950,7 @@ def get_default_metadata_fields(modality, sampling_rate, n_channels, task_label=
         {"key": "CommunicationProtocol", "value": "SPI", "include": True},
         {"key": "SamplingFrequency", "value": sampling_rate, "include": True},
         {"key": "PowerLineFrequency", "value": 50, "include": True},
-        {"key": "SoftwareVersions", "value": "BrainFlow, MNE-Python", "include": True},
+        {"key": "SoftwareVersions", "value": software_versions_string(), "include": True},
         # Signal and channels
         {"key": "RecordingType", "value": "continuous", "include": True},
         {"key": "SignalType", "value": modality, "include": True},
@@ -856,8 +972,18 @@ def get_default_metadata_fields(modality, sampling_rate, n_channels, task_label=
             {"key": "EEGPlacementScheme", "value": "Custom", "include": True}
         ])
     elif modality == "emg":
+        # EMGReference and EMGPlacementScheme are REQUIRED by BIDS for the emg
+        # data type. They are exposed in the metadata editor so the operator can
+        # record the real electrode placement for each session — that placement
+        # is what lets the Decoding team explain why a model trained on one
+        # session does not transfer to the next.
         base_fields.extend([
             {"key": "EMGChannelCount", "value": n_channels, "include": True},
+            {"key": "EMGReference", "value": "Bipolar", "include": True},
+            {"key": "EMGPlacementScheme", "value": "Other", "include": True},
+            {"key": "EMGPlacementSchemeDescription",
+             "value": "Surface electrodes on the forearm — describe the exact positions used.",
+             "include": True},
             {"key": "RecordingDevice", "value": "Surface EMG", "include": True}
         ])
     else:
@@ -2286,31 +2412,45 @@ def create_bids_edf(data, subject_id='01', task='resting', run='01', sampling_ra
         "ManufacturersModelName": "PiEEG Board",
         "SamplingFrequency": sampling_rate,
         "PowerLineFrequency": 50,
-        "EEGChannelCount": n_channels if signal_type == 'eeg' else 0,
+        # Channel-count keys are modality-specific in BIDS: an EMG sidecar should
+        # not carry EEGChannelCount, even as 0.  The count for this recording's
+        # own modality is added just below, together with the other required keys.
         "EOGChannelCount": 0,
         "ECGChannelCount": 0,
-        "EMGChannelCount": n_channels if signal_type == 'emg' else 0,
-        "MotionChannelCount": n_channels if signal_type == 'motion' else 0,
         "MiscChannelCount": 0,
         "TriggerChannelCount": 0,
         "RecordingDuration": len(data_truncated[0]) / sampling_rate if len(data_truncated) > 0 else 0,
         "RecordingType": "continuous",
-        "EEGReference": "Common average reference" if ref_enabled else "n/a",
-        "EEGGround": "BIASOUT" if biasout_enabled else "n/a",
-        "EEGPlacementScheme": "Custom",
-        "SoftwareFilters": {
-            "Bandpass filter": {
-                "lower cutoff (Hz)": lowcut,
-                "upper cutoff (Hz)": highcut,
-                "order": order
-            }
-        } if bandpass_enabled else "n/a",
+        "SoftwareFilters": describe_software_filters(signal_type),
         "HardwareFilters": "n/a",
-        "SoftwareVersions": "BrainFlow 5.10.1, MNE-Python",
+        "SoftwareVersions": software_versions_string(),
         "SubjectArtefactDescription": "n/a",
         "DownsampleFactor": downsample_factor
     }
-    
+
+    # --- Modality-specific required fields ---
+    # BIDS defines a different set of required sidecar keys per data type.
+    # Writing EEG keys into an EMG sidecar (or the reverse) makes the dataset
+    # invalid, so only the keys belonging to this recording are added.
+    if signal_type == 'emg':
+        # Required for the "emg" data type, which became official in BIDS v1.11.0.
+        json_metadata["EMGChannelCount"] = n_channels
+        json_metadata["EMGReference"] = "Bipolar"
+        json_metadata["EMGPlacementScheme"] = "Other"
+        json_metadata["EMGPlacementSchemeDescription"] = (
+            "Surface electrodes placed on the forearm. Record the exact positions "
+            "for each session — electrode shift between sessions is the main reason "
+            "a decoder trained on one day fails on the next."
+        )
+    elif signal_type == 'eeg':
+        json_metadata["EEGChannelCount"] = n_channels
+        json_metadata["EEGReference"] = "Common average reference" if ref_enabled else "n/a"
+        json_metadata["EEGGround"] = "BIASOUT" if biasout_enabled else "n/a"
+        json_metadata["EEGPlacementScheme"] = "Custom"
+    elif signal_type == 'motion':
+        json_metadata["MotionChannelCount"] = n_channels
+
+
     # Create channels.tsv content
     channels_tsv = "name\ttype\tunits\tdescription\tstatus\n"
     for i in range(n_channels):
@@ -2365,6 +2505,20 @@ def save_bids_recording(data, markers, subject_id, session_id, task, run, sampli
     json_metadata["TaskName"] = task
     json_metadata["SamplingFrequency"] = sampling_rate
     json_metadata["Session"] = session_id
+
+    # Facts the app knows about *this* recording win over the Metadata Editor rows.
+    # Those rows are filled in when the page loads or the signal type changes, and
+    # nothing refreshes them when the operator later edits Subject / Run or the
+    # channel count.  Without this, a sidecar can say "subject 01, 8 channels"
+    # next to a file that holds subject 98 and 6 channels.  A row the operator
+    # switched off in the editor stays off — only rows that are present are corrected.
+    count_key = {"eeg": "EEGChannelCount", "emg": "EMGChannelCount",
+                 "motion": "MotionChannelCount"}.get(modality)
+    for key, actual in (("Subject", subject_id), ("Run", run),
+                        ("NumberOfChannels", n_channels), (count_key, n_channels)):
+        if key and key in json_metadata:
+            json_metadata[key] = actual
+
     json_metadata["RecordingDuration"] = duration
     json_metadata["RecordingStartTime"] = recording_start_time
     json_metadata["RecordingPaused"] = recording_paused
@@ -2806,17 +2960,64 @@ def add_marker():
     description = payload.get('description', '')
     timestamp = time.time()
     offset = timestamp - recording_start_time if recording_start_time else 0
-    
+
+    # An explicit duration (seconds) can be supplied when it is already known —
+    # for example by a cued protocol that shows "close hand for 3 s".  When it
+    # is omitted the marker stays open and /end-marker closes it.
+    duration = payload.get('duration')
+    try:
+        duration = float(duration) if duration is not None else None
+        if duration is not None and duration < 0:
+            duration = None
+    except (TypeError, ValueError):
+        duration = None
+
     marker = {
         "label": label,
         "description": description,
         "time": timestamp,
-        "offset": offset
+        "offset": offset,
+        "duration": duration
     }
     with event_lock:
         event_markers.append(marker)
         total = len(event_markers)
     return jsonify({"status": "marker_added", "marker": marker, "total_markers": total})
+
+
+@app.route('/end-marker', methods=['POST'])
+def end_marker():
+    """Close an open marker and record how long the event actually lasted.
+
+    Call /add-marker when the participant starts a movement and /end-marker
+    when they stop, and the events.tsv will carry a real onset *and* duration —
+    which is what the Decoding team needs to cut training windows.
+
+    Send {"label": "grip"} to close the most recent open marker with that
+    label, or send nothing to close the most recent open marker of any label.
+    """
+    if not recording_active:
+        return jsonify({"status": "error", "message": "Recording is not active"}), 400
+
+    payload = request.get_json(silent=True) or {}
+    label = payload.get('label')
+    now = time.time()
+
+    with event_lock:
+        # Walk backwards so the most recently opened marker is closed first.
+        for marker in reversed(event_markers):
+            if marker.get("duration") is not None:
+                continue
+            if label is not None and marker.get("label") != label:
+                continue
+            marker["duration"] = max(0.0, now - marker.get("time", now))
+            return jsonify({"status": "marker_closed", "marker": marker})
+
+    message = (
+        f"No open marker found with label '{label}'." if label
+        else "No open marker to close."
+    )
+    return jsonify({"status": "error", "message": message}), 404
 
 @app.route('/stop-recording', methods=['POST'])
 def stop_recording():
