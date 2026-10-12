@@ -119,7 +119,7 @@ Hardware mode with **EEG**, on a Raspberry Pi with the PiEEG shield. `PIEEG_SERI
 
 | Symptom | Fix |
 |---|---|
-| Page opens but the chart stays empty and the metrics show `--` | No internet: Chart.js and Socket.IO load from CDNs. Reconnect and reload. |
+| Page opens but the chart stays empty and the metrics show `--` | Check that `visual_interface/static/vendor/` contains `chart.umd.js` and `socket.io.min.js`, that the server is still running in the terminal, then reload. The browser console (Network tab) shows a 404 if a file is missing. The page itself works offline. |
 | Chart empty after **Start Stream** | Is the mode switch right? Is a file loaded if you expect replay? Read the terminal. |
 | `Permission denied` on `./run_local.sh` | `chmod +x visual_interface/run_local.sh` |
 | Port 5001 is busy | `PORT=5002 ./run_local.sh` |
