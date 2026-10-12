@@ -32,7 +32,7 @@ Open **http://127.0.0.1:5001**, switch on **Simulation Mode**, press **Start Str
 
 The script creates a virtual environment, installs the dependencies and starts the server. Start it this way and not with `flask run`: the Socket.IO server has to be launched through `app.py`. No bash (Windows)? See [manual setup](docs/USER_GUIDE.md#manual-setup).
 
-> **Needs internet.** The page loads Chart.js and Socket.IO from CDNs; offline it opens but draws nothing and shows no error. Python 3.10+, tested on 3.14.
+> **Internet is only needed for the first setup** (cloning the repository and installing the Python dependencies). Once installed, the interface runs fully offline: Chart.js and Socket.IO are served from `visual_interface/static/vendor/`. Python 3.10+, tested on 3.14.
 
 ## What's where
 

@@ -29,7 +29,7 @@ Every source ends in the same function, `process_and_emit_chunk()`. Upstream is 
 | Change the filters | `apply_filters()` · `update_filter_coefficients()` · the `lowcut` / `highcut` defaults at the top of `app.py` |
 | Change what is saved | `create_bids_edf()` · `save_bids_recording()` · `get_default_metadata_fields()` |
 | Change markers and events | `/add-marker` · `/end-marker` · `create_events_tsv()` |
-| Change the page | `templates/index.html` · `static/js/app.js` (charts, controls) · `static/styles.css` |
+| Change the page | `templates/index.html` · `static/js/app.js` (charts, controls) · `static/styles.css` · `static/vendor/` (Chart.js, Socket.IO) |
 
 The acquisition threads, started as Socket.IO background tasks from `/start-analysis`, which picks one from the mode switch, the signal type and `hardware_source`:
 
@@ -62,7 +62,7 @@ Ranked by how much they matter for next year's recordings. This is the to-do lis
 
 | # | Problem | Why it matters | Fix |
 |---|---|---|---|
-| 1 | The page loads Chart.js (**unpinned**) and Socket.IO 4.0.0 from CDNs | With no internet (restricted hospital Wi-Fi, for example) the page opens but draws nothing and shows no error; a new Chart.js release could also change behaviour | Download both into `static/vendor/` and load them with `url_for('static', …)` |
+| 1 | ✅ ~~The page loads Chart.js (unpinned) and Socket.IO 4.0.0 from CDNs~~ | **Resolved:** both libraries are now served from `static/vendor/` (Socket.IO 4.0.0, Chart.js 4.4.1) with `url_for('static', …)` in `templates/index.html`. The page works with no internet once the app is installed; internet is only needed to clone the repository and install the Python dependencies the first time. | To upgrade a library, replace its file in `static/vendor/` |
 | 2 | No control selects the hardware source; the page never calls `/set-hardware-source` | The DSI-24 cannot be started from the browser | Add a `pieeg` / `dsi_lsl` dropdown |
 | 3 | Bracelet samples are raw ADC counts (zero-centred), labelled µV | Units in the charts, `channels.tsv` and the EDF are wrong; amplitudes are not comparable across devices | Get the analogue gain from the EMG team, then convert or label the units `a.u.` |
 | 4 | The page cannot give a marker a duration, and there is no cued protocol | Decoding cannot cut training windows exactly; labels carry the operator's reaction time | A protocol runner that calls `/add-marker` and `/end-marker` on a timer. **Build this first** |
@@ -83,6 +83,8 @@ python tests/test_recording.py     # no pytest needed
 They check marker durations, the BIDS sidecar, `dataset_description.json`, and that a sidecar cannot contradict the file it describes.
 
 ## Last verified
+
+- ✅ page loads, charts draw and simulations restart with no internet, on 12 Oct 2026 (Chart.js and Socket.IO served from `static/vendor/`), once the app is installed
 
 29 Sep 2026 on macOS with Python 3.14.
 
