@@ -171,6 +171,29 @@ def test_a_row_the_operator_switched_off_stays_off():
     assert "Subject" not in sidecar, sidecar.get("Subject")
     assert "NumberOfChannels" not in sidecar, sidecar.get("NumberOfChannels")
 
+def test_stimulus_codes_become_markers_despite_duplicates():
+    app.recording_active = True
+    app.recording_start_time = time.time()
+    with app.event_lock:
+        app.event_markers.clear()
+
+    def code(phase):  # right arm (2), side (2), movement 2
+        return 10000 * phase + 1000 * 2 + 100 * 2 + 2
+
+    state = {}
+    sequence = [(3, 0.0), (3, 0.01),     # prep, sent twice
+                (5, 3.0), (5, 3.001),    # move onset, sent twice
+                (7, 6.0), (5, 6.001),    # return + the extra "move" code
+                (9, 8.0), (5, 8.001)]    # ITI + the extra "move" code
+    for phase, t in sequence:
+        app.handle_stim_code(code(phase), 1000.0 + t, state)
+
+    with app.event_lock:
+        markers = list(app.event_markers)
+    assert len(markers) == 1, markers
+    assert markers[0]["label"] == "close_index", markers[0]["label"]
+    assert abs(markers[0]["duration"] - 3.0) < 1e-6, markers[0]["duration"]
+    assert "arm=right" in markers[0]["description"], markers[0]["description"]
 
 def main():
     tests = [value for name, value in sorted(globals().items())
