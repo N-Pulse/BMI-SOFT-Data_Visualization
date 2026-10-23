@@ -1121,6 +1121,10 @@ function pauseRecording() {
 
 function stopRecording() {
   if (!isRecording) return;
+    if (markers.some(m => m.duration == null) &&
+      !confirm('Some markers are still open (no duration). Stop anyway?')) {
+    return;
+  }
   const subject = document.getElementById('recSubject').value || '01';
   const session = document.getElementById('recSession').value || '01';
   const task = document.getElementById('recTask').value || 'resting';
@@ -1196,6 +1200,68 @@ function addMarker() {
     .catch(error => console.error('[client] Error adding marker:', error));
 }
 
+function endMarker() {
+  if (!isRecording) {
+    alert('Start recording to end markers.');
+    return;
+  }
+  fetch('/end-marker', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({})   // sans label : ferme le dernier marqueur ouvert
+  })
+    .then(parseJsonResponse)
+    .then(data => {
+      if (data.marker) {
+        const idx = markers.findIndex(m => m.time === data.marker.time);
+        if (idx >= 0) markers[idx] = data.marker;
+        renderMarkers();
+      }
+    })
+    .catch(error => {
+      console.error('[client] Error ending marker:', error);
+      alert(error.message || 'No open marker to close');
+    });
+}
+
+// ── Stimulus PC listener ─────────────────────────────────────────────────────
+function setStimStatus(text) {
+  const el = document.getElementById('stimStatus');
+  if (el) el.textContent = text;
+}
+
+function setStimButtons(listening) {
+  document.getElementById('startStimBtn').disabled = listening;
+  document.getElementById('stopStimBtn').disabled = !listening;
+}
+
+function startStimListener() {
+  fetch('/start-stim-listener', { method: 'POST' })
+    .then(parseJsonResponse)
+    .then(() => {
+      setStimButtons(true);
+      setStimStatus('Searching for the stimulus stream...');
+    })
+    .catch(error => alert(error.message || 'Could not start the listener'));
+}
+
+function stopStimListener() {
+  fetch('/stop-stim-listener', { method: 'POST' })
+    .catch(err => console.error('[client] stop listener:', err));
+}
+
+socket.on('stim_listener', d => {
+  setStimStatus(d.message || d.status);
+  if (d.status === 'stopped') setStimButtons(false);
+});
+
+// Called when a marker opens, and again when it closes (same `time` value).
+socket.on('stim_marker', m => {
+  const idx = markers.findIndex(x => x.time === m.time);
+  if (idx >= 0) markers[idx] = m; else markers.push(m);
+  renderMarkers();
+});
+
 function renderMarkers() {
   const list = document.getElementById('markerList');
   if (!list) return;
@@ -1221,8 +1287,13 @@ function renderMarkers() {
   }
 
   if (markers.length) {
-    const recRows = markers
-      .map(m => `<div class="marker-item"><span>${escapeHtml(m.label)}</span><span>${Number(m.offset || 0).toFixed(2)}s</span></div>`)
+        const recRows = markers
+      .map(m => {
+        const dur = (m.duration === null || m.duration === undefined)
+          ? 'open'
+          : `${Number(m.duration).toFixed(2)}s`;
+        return `<div class="marker-item"><span>${escapeHtml(m.label)}</span><span>${Number(m.offset || 0).toFixed(2)}s / ${dur}</span></div>`;
+      })
       .join('');
     sections.push(`<div class="marker-item"><strong>Manual markers</strong><span>${markers.length}</span></div>${recRows}`);
   }

@@ -19,6 +19,7 @@ Record, replay and visualise **EEG / EMG** signals in real time, in the browser,
 | **EMG bracelet** | EMG · 6 channels · 500 Hz | Arduino UNO R4 with the Chords firmware, over USB | ✅ |
 | DSI-24 headset | EEG | the DSI-to-LSL bridge running | ⚠️ untested · [not selectable in the page](docs/USER_GUIDE.md#dsi-24-headset-via-lsl) |
 | PiEEG | EEG | Raspberry Pi with the PiEEG shield | ❔ not verified |
+| Stimulus-PC markers | event markers | `eeg_emg_v3.py` on a second computer, same local network (LSL `stimulus_stream`) | ✅ simulated stream · ❔ real script and two computers |
 
 ## Quick start
 
@@ -41,7 +42,7 @@ The script creates a virtual environment, installs the dependencies and starts t
 | [`visual_interface/app.py`](visual_interface/app.py) | The whole backend: acquisition, filtering, recording, BIDS export |
 | [`visual_interface/templates/`](visual_interface/templates) · [`static/`](visual_interface/static) | The web page |
 | [`visual_interface/tests/`](visual_interface/tests) | Tests for the recording path |
-| [`visual_interface/scripts/`](visual_interface/scripts) | Sample-data generators |
+| [`visual_interface/scripts/`](visual_interface/scripts) | Sample-data generators and `fake_stimulus.py`, a simulated stimulus PC |
 | [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) | Using the interface, hardware setup, troubleshooting |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | How it works, adding a source, **known limitations** |
 

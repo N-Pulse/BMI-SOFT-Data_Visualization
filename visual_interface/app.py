@@ -3019,6 +3019,131 @@ def end_marker():
     )
     return jsonify({"status": "error", "message": message}), 404
 
+# ── Stimulus PC listener ─────────────────────────────────────────────────────
+# eeg_emg_v3.py publishes int32 LSL markers: 10000*phase + 1000*arm
+# + 100*orientation + movement. Phases: cue 1, prep 3, move 5, return 7, ITI 9.
+# Phase 0 = special codes (9999, 8888, 9701, 9702, 8899).
+STIM_LSL_NAME = os.environ.get("STIM_LSL_NAME", "stimulus_stream")
+ARMS = {1: "left", 2: "right"}
+ORIENTATIONS = {1: "up", 2: "side", 3: "down"}
+# Names per movement code (table of the acquisition protocol, section 3.1).
+# The protocol lists some movements under two codes, so both map to one label.
+MOVEMENT_NAMES = {
+    1: "close_four_fingers", 2: "close_index", 3: "close_middle", 4: "close_only_thumb",
+    5: "close_pinky", 6: "close_ring", 7: "close_thumb",
+    8: "fist_max_force", 9: "fist_normal_force", 10: "fist_fast",
+    11: "fist_max_force", 12: "fist_normal_force", 13: "fist_slow",
+    14: "grasp_cup", 15: "grasp_donut", 16: "pinch_pen_2_fingers", 17: "pinch_pen_all_fingers",
+    18: "open_four_fingers", 19: "open_index", 20: "open_middle", 21: "open_only_thumb",
+    22: "open_pinky", 23: "open_pinky", 24: "open_ring", 25: "open_thumb",
+    26: "open_hand_fast", 27: "open_hand_slow",
+    28: "wrist_dorsiflexion_max", 29: "wrist_dorsiflexion_normal",
+    30: "wrist_palmarflexion_max", 31: "wrist_palmarflexion_normal",
+}
+stim_listener_running = False
+stim_listener_stop = threading.Event()
+
+
+def decode_stim_code(code):
+    phase, rest = divmod(int(code), 10000)
+    arm, rest = divmod(rest, 1000)
+    orientation, movement = divmod(rest, 100)
+    return phase, arm, orientation, movement
+
+
+def handle_stim_code(code, unix_ts, state):
+    """Turn one stimulus-PC code into markers; return the markers that changed.
+
+    The stimulus script sends each event twice, and its second "return" and
+    "ITI" markers carry the move code. A move is therefore accepted only right
+    after a prep code (state["armed"]), and any other code closes the open one.
+    """
+    phase, arm, orientation, movement = decode_stim_code(code)
+    changed = []
+
+    if phase == 5:
+        if state.get("armed") and recording_active:
+            marker = {
+                "label": MOVEMENT_NAMES.get(movement, f"movement_{movement}"),
+                "description": (f"arm={ARMS.get(arm, '?')}; "
+                                f"orientation={ORIENTATIONS.get(orientation, '?')}; code={code}"),
+                "time": unix_ts,
+                "offset": max(0.0, unix_ts - recording_start_time) if recording_start_time else 0.0,
+                "duration": None,
+            }
+            with event_lock:
+                event_markers.append(marker)
+            state["open"] = marker
+            state["armed"] = False
+            changed.append(marker)
+        return changed
+
+    open_marker = state.get("open")
+    if open_marker is not None:
+        with event_lock:
+            open_marker["duration"] = max(0.0, unix_ts - open_marker["time"])
+        state["open"] = None
+        changed.append(open_marker)
+    state["armed"] = (phase == 3)
+    return changed
+
+
+def stim_listener_task():
+    global stim_listener_running
+    state = {}
+    message = "Stopped"
+    try:
+        from pylsl import StreamInlet, resolve_byprop, local_clock
+        streams = resolve_byprop("name", STIM_LSL_NAME, timeout=8)
+        if not streams:
+            raise RuntimeError(
+                f"No LSL stream named '{STIM_LSL_NAME}' found. Start the stimulus "
+                "script first and check that both computers are on the same network."
+            )
+        inlet = StreamInlet(streams[0])
+        socketio.emit('stim_listener', {"status": "connected",
+                                        "message": f"Connected to {STIM_LSL_NAME}"})
+        while not stim_listener_stop.is_set():
+            sample, ts = inlet.pull_sample(timeout=0.2)
+            if sample is None:
+                continue
+            try:
+                correction = inlet.time_correction(timeout=0.5)
+            except Exception:
+                correction = 0.0
+            # LSL clock -> unix time, so offsets match the other markers
+            unix_ts = time.time() - (local_clock() - (ts + correction))
+            for marker in handle_stim_code(int(sample[0]), unix_ts, state):
+                socketio.emit('stim_marker', dict(marker))
+    except Exception as exc:
+        logging.error("Stimulus listener error: %s", exc)
+        message = str(exc)
+    finally:
+        open_marker = state.get("open")
+        if open_marker is not None:
+            with event_lock:
+                open_marker["duration"] = max(0.0, time.time() - open_marker["time"])
+            socketio.emit('stim_marker', dict(open_marker))
+        stim_listener_running = False
+        socketio.emit('stim_listener', {"status": "stopped", "message": message})
+
+
+@app.route('/start-stim-listener', methods=['POST'])
+def start_stim_listener():
+    global stim_listener_running
+    if stim_listener_running:
+        return jsonify({"status": "error", "message": "Listener already running"}), 409
+    stim_listener_stop.clear()
+    stim_listener_running = True
+    socketio.start_background_task(stim_listener_task)
+    return jsonify({"status": "listening"})
+
+
+@app.route('/stop-stim-listener', methods=['POST'])
+def stop_stim_listener():
+    stim_listener_stop.set()
+    return jsonify({"status": "stopping"})
+
 @app.route('/stop-recording', methods=['POST'])
 def stop_recording():
     """Finalize recording and return a BIDS-friendly archive.

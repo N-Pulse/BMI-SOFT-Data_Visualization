@@ -452,7 +452,16 @@
                 <div class="event-row">
                     <input type="text" id="markerLabel" placeholder="Marker label (e.g., blink)">
                     <input type="text" id="markerDescription" placeholder="Description (optional)">
-                    <button onclick="addMarker()">Add Marker</button>
+                    <button onclick="addMarker()">Start Marker</button>
+                    <button onclick="endMarker()">End Marker</button>
+                </div>
+                <div style="margin-top:12px; padding-top:10px; border-top:1px solid rgba(255,255,255,0.1);">
+                    <h3 style="margin:0 0 8px;">Stimulus PC (LSL)</h3>
+                    <div class="controls">
+                        <button id="startStimBtn" onclick="startStimListener()">Listen to stimulus</button>
+                        <button id="stopStimBtn" onclick="stopStimListener()" disabled>Stop listening</button>
+                    </div>
+                     <div id="stimStatus" class="file-status"></div>
                 </div>
                 <div id="markerList" class="marker-list"></div>
             </div>

@@ -62,7 +62,7 @@ The files land in `visual_interface/bids_output/` on the machine running the ser
 
 > ⚠️ **What is saved is processed, not raw.** Everything you switch on under Signal Processing is applied before the data is recorded, and no raw copy is kept. The sidecar's `SoftwareFilters` lists what was on when you pressed **Stop & Save**, so do not change the processing mid-recording.
 >
-> ⚠️ **Markers from the button have no duration.** They are written as `n/a` in `events.tsv`, never as a fake `0`. A duration needs the API: `POST /add-marker` when the movement starts and `POST /end-marker` when it ends. A cued protocol that does this on a timer is the next feature to build ([known limitations](ARCHITECTURE.md#known-limitations)).
+> ⚠️ **A marker needs an end to get a duration.** From the buttons, click **Start Marker** then **End Marker**. From the stimulus PC, the end comes from the next code (return). A marker that is never closed is written as `n/a`, never as a fake `0`. Durations include reaction time and the video length, not the real muscle activity.
 >
 > ⚠️ **Recordings are personal data.** `bids_output/` is git-ignored. Never commit or share it outside the ethics-approved workflow.
 
@@ -115,6 +115,20 @@ Hardware mode with **EEG**, on a Raspberry Pi with the PiEEG shield. `PIEEG_SERI
 
 `PORT=5002 python app.py` changes the port (on Windows, `set PORT=5002` first).
 
+### Stimulus PC (automatic markers)
+
+When the experiment runs on another computer with `eeg_emg_v3.py`, the interface creates the markers itself from the script's LSL stream `stimulus_stream`.
+
+1. Put both computers on the same local network. A direct Ethernet cable or a switch is the most reliable; hospital Wi-Fi often blocks LSL.
+2. Start the stimulus script and wait for its start countdown.
+3. Check that the stream is visible from the interface computer: `python -c "from pylsl import resolve_streams; [print(s.name(), s.hostname()) for s in resolve_streams(5)]"` must list `stimulus_stream`.
+4. In the interface: **Start Stream**, **Start Recording**, then **Listen to stimulus** (during the countdown). The status shows *Connected to stimulus_stream*.
+5. **Stop & Save** as usual.
+
+Each movement becomes one marker: the label is the movement name, the description holds the arm, orientation and code. It starts at the *move* code and ends at the next code (return), so its duration is the video length. Preparation, return, rest and the observation video create no marker. A movement is only accepted right after its preparation code, which filters the script's duplicated codes, so click **Listen to stimulus** before the first trial.
+
+Names come from the acquisition protocol's movement table (`MOVEMENT_NAMES` in `app.py`). Use `STIM_LSL_NAME` for another stream name. To try it without the second computer: `python scripts/fake_stimulus.py --blocks 2 --rest 0 --delay 10`.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -128,3 +142,5 @@ Hardware mode with **EEG**, on a Raspberry Pi with the PiEEG shield. `PIEEG_SERI
 | No scrubber | It only appears in file replay. |
 | Noisy signal | **Calibrate**, then turn on **Baseline Correction**. |
 | `ImportError` | Run `./run_local.sh` again: it re-checks the dependencies on every start. |
+| *No LSL stream named 'stimulus_stream' found* | Start the stimulus script first, check that both computers are on the same network and that the firewall allows Python, then click **Listen to stimulus** again. |
+| Connected, but no markers | **Start Recording** must be active, and **Listen to stimulus** must be clicked before the first trial. |
