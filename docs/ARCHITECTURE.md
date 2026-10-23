@@ -30,6 +30,7 @@ Every source ends in the same function, `process_and_emit_chunk()`. Upstream is 
 | Change what is saved | `create_bids_edf()` · `save_bids_recording()` · `get_default_metadata_fields()` |
 | Change markers and events | `/add-marker` · `/end-marker` · `create_events_tsv()` |
 | Change the page | `templates/index.html` · `static/js/app.js` (charts, controls) · `static/styles.css` · `static/vendor/` (Chart.js, Socket.IO) |
+| Change how stimulus-PC codes become markers | `decode_stim_code()` · `handle_stim_code()` · `MOVEMENT_NAMES` in `app.py` |
 
 The acquisition threads, started as Socket.IO background tasks from `/start-analysis`, which picks one from the mode switch, the signal type and `hardware_source`:
 
@@ -65,12 +66,25 @@ Ranked by how much they matter for next year's recordings. This is the to-do lis
 | 1 | ✅ ~~The page loads Chart.js (unpinned) and Socket.IO 4.0.0 from CDNs~~ | **Resolved:** both libraries are now served from `static/vendor/` (Socket.IO 4.0.0, Chart.js 4.4.1) with `url_for('static', …)` in `templates/index.html`. The page works with no internet once the app is installed; internet is only needed to clone the repository and install the Python dependencies the first time. | To upgrade a library, replace its file in `static/vendor/` |
 | 2 | No control selects the hardware source; the page never calls `/set-hardware-source` | The DSI-24 cannot be started from the browser | Add a `pieeg` / `dsi_lsl` dropdown |
 | 3 | Bracelet samples are raw ADC counts (zero-centred), labelled µV | Units in the charts, `channels.tsv` and the EDF are wrong; amplitudes are not comparable across devices | Get the analogue gain from the EMG team, then convert or label the units `a.u.` |
-| 4 | The page cannot give a marker a duration, and there is no cued protocol | Decoding cannot cut training windows exactly; labels carry the operator's reaction time | A protocol runner that calls `/add-marker` and `/end-marker` on a timer. **Build this first** |
+| 4 | Markers get durations from the End Marker button or from the stimulus PC's LSL stream, but there is no cued protocol inside the interface | Durations include reaction time; the listener only helps sessions that use `eeg_emg_v3.py` | A protocol runner calling `/add-marker` and `/end-marker` on a timer, if sessions run without the stimulus PC |
 | 5 | Metadata defaults still describe the PiEEG (*Manufacturer*, *Model*, *Communication Protocol*, *Institution*); `TaskDescription` and the `Filter*` rows are static | Bracelet sidecars name the wrong device unless edited each time; `FilterHighPass`, `FilterLowPass` and `FilterOrder` appear even with the bandpass off, so trust `SoftwareFilters` | Bracelet-aware defaults (needs the official device names from the EMG team) |
 | 6 | Filter defaults are EEG-shaped, 3–45 Hz | Would remove most EMG power if enabled for EMG. The useful band is roughly 20–450 Hz, and at 500 Hz sampling only frequencies below 250 Hz are usable | Per-signal presets, clamped to the Nyquist frequency |
 | 7 | Filtering runs on each ~100 ms chunk with `filtfilt` and carries no state | Edge transients at every chunk boundary; not the same as filtering the continuous signal | `scipy.signal.sosfilt` with retained `zi` |
 | 8 | Only processed data is saved, and `SoftwareFilters` reflects the settings at *save* time | Nothing can be re-filtered later; changing settings mid-recording misdescribes the file | Save raw data in parallel; snapshot the settings at start |
 | 9 | The tests cover the recording path only | Serial parsing, replay and the frontend are untested | Add a serial test, for example a pseudo-terminal that streams Chords packets |
+| 10 | The stimulus listener was written from the acquisition protocol document, not from `eeg_emg_v3.py`, and has only run against a simulated stream on one computer | If the real script's codes differ from the description, markers will be wrong or missing; LSL discovery across two machines is untested | Run it once with the real script on two computers and compare `events.tsv` with the script's log |
+
+## Markers from the stimulus PC
+
+`eeg_emg_v3.py` publishes int32 LSL codes: `10000·phase + 1000·arm + 100·orientation + movement`. The interface listens to `stimulus_stream` (`stim_listener_task()`):
+
+| Code | Effect |
+|---|---|
+| phase 3 (preparation) | arms the listener |
+| phase 5 (move), right after a preparation | opens a marker (label from `MOVEMENT_NAMES`) |
+| any other code | closes the open marker, which gives its duration |
+
+The script sends each event twice and its return and ITI events carry the move code, so a move is only accepted right after a preparation.
 
 ## Tests
 
@@ -80,9 +94,12 @@ source ../.venv/bin/activate       # created by run_local.sh
 python tests/test_recording.py     # no pytest needed
 ```
 
-They check marker durations, the BIDS sidecar, `dataset_description.json`, and that a sidecar cannot contradict the file it describes.
+They check marker durations, the BIDS sidecar, `dataset_description.json`, that a sidecar cannot contradict the file it describes, and that stimulus-PC codes (duplicates included) become one marker per movement.
 
 ## Last verified
+
+- ✅ 23 Oct 2026: stimulus-PC markers against a simulated LSL stream (`scripts/fake_stimulus.py`: one arm, 3 consecutive repetitions per block, random block order); every trial gives one marker with a ~3 s duration in `events.tsv`
+- ❔ not verified: the real `eeg_emg_v3.py`, LSL across two computers
 
 - ✅ page loads, charts draw and simulations restart with no internet, on 12 Oct 2026 (Chart.js and Socket.IO served from `static/vendor/`), once the app is installed
 
