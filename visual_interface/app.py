@@ -3026,19 +3026,24 @@ def end_marker():
 STIM_LSL_NAME = os.environ.get("STIM_LSL_NAME", "stimulus_stream")
 ARMS = {1: "left", 2: "right"}
 ORIENTATIONS = {1: "up", 2: "side", 3: "down"}
-# Names per movement code (table of the acquisition protocol, section 3.1).
-# The protocol lists some movements under two codes, so both map to one label.
+# The digit sent after the arm is the baseline (1-6): orientation, plus 3 when
+# the hand starts closed (see decode in handle_stim_code).
+# Names per movement code: table 2 of the acquisition protocol (October 2026).
+# The script's own list has more entries; an unknown code still creates a
+# marker, named "movement_<code>".
 MOVEMENT_NAMES = {
-    1: "close_four_fingers", 2: "close_index", 3: "close_middle", 4: "close_only_thumb",
-    5: "close_pinky", 6: "close_ring", 7: "close_thumb",
-    8: "fist_max_force", 9: "fist_normal_force", 10: "fist_fast",
-    11: "fist_max_force", 12: "fist_normal_force", 13: "fist_slow",
-    14: "grasp_cup", 15: "grasp_donut", 16: "pinch_pen_2_fingers", 17: "pinch_pen_all_fingers",
-    18: "open_four_fingers", 19: "open_index", 20: "open_middle", 21: "open_only_thumb",
-    22: "open_pinky", 23: "open_pinky", 24: "open_ring", 25: "open_thumb",
-    26: "open_hand_fast", 27: "open_hand_slow",
-    28: "wrist_dorsiflexion_max", 29: "wrist_dorsiflexion_normal",
-    30: "wrist_palmarflexion_max", 31: "wrist_palmarflexion_normal",
+    1: "close_four_fingers", 2: "close_index", 3: "close_middle",
+    4: "close_thumb_over_palm", 5: "close_pinky", 6: "close_ring",
+    9: "close_all_fingers", 12: "close_all_fingers",   # 9 = up, 12 = side/down
+    14: "grab_cup_5_fingers", 16: "pinch_pen_thumb_index",
+    17: "pinch_pen_all_fingers", 18: "open_four_fingers",
+    19: "open_index", 20: "open_middle", 21: "open_thumb_over_palm",
+    22: "open_pinky", 23: "open_pinky",                # 22 = up, 23 = side/down
+    24: "open_ring", 29: "wrist_dorsiflexion", 31: "wrist_palmarflexion",
+    32: "wrist_palmarflexion_closed_hand", 33: "wrist_dorsiflexion_closed_hand",
+    34: "wrist_rotation", 35: "open_thumb_over_fingers",
+    36: "close_thumb_over_fingers", 37: "open_all_fingers",
+    38: "grab_cup_4_fingers", 39: "pinch_pen_thumb_index_middle",
 }
 stim_listener_running = False
 stim_listener_stop = threading.Event()
@@ -3058,15 +3063,18 @@ def handle_stim_code(code, unix_ts, state):
     "ITI" markers carry the move code. A move is therefore accepted only right
     after a prep code (state["armed"]), and any other code closes the open one.
     """
-    phase, arm, orientation, movement = decode_stim_code(code)
+    phase, arm, baseline, movement = decode_stim_code(code)
+    orientation = ((baseline - 1) % 3) + 1 if baseline else 0
+    hand = "closed" if baseline >= 4 else "open"
     changed = []
 
     if phase == 5:
         if state.get("armed") and recording_active:
             marker = {
                 "label": MOVEMENT_NAMES.get(movement, f"movement_{movement}"),
-                "description": (f"arm={ARMS.get(arm, '?')}; "
-                                f"orientation={ORIENTATIONS.get(orientation, '?')}; code={code}"),
+                "description": (f"arm={ARMS.get(arm, '?')}; baseline={baseline}; "
+                                f"orientation={ORIENTATIONS.get(orientation, '?')}; "
+                                f"hand={hand}; code={code}"),
                 "time": unix_ts,
                 "offset": max(0.0, unix_ts - recording_start_time) if recording_start_time else 0.0,
                 "duration": None,

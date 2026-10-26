@@ -72,11 +72,11 @@ Ranked by how much they matter for next year's recordings. This is the to-do lis
 | 7 | Filtering runs on each ~100 ms chunk with `filtfilt` and carries no state | Edge transients at every chunk boundary; not the same as filtering the continuous signal | `scipy.signal.sosfilt` with retained `zi` |
 | 8 | Only processed data is saved, and `SoftwareFilters` reflects the settings at *save* time | Nothing can be re-filtered later; changing settings mid-recording misdescribes the file | Save raw data in parallel; snapshot the settings at start |
 | 9 | The tests cover the recording path only | Serial parsing, replay and the frontend are untested | Add a serial test, for example a pseudo-terminal that streams Chords packets |
-| 10 | The stimulus listener was written from the acquisition protocol document, not from `eeg_emg_v3.py`, and has only run against a simulated stream on one computer | If the real script's codes differ from the description, markers will be wrong or missing; LSL discovery across two machines is untested | Run it once with the real script on two computers and compare `events.tsv` with the script's log |
+| 10 | The stimulus listener follows the movement table of the protocol (28 codes); the protocol's marker section is still "to be completed", and the script's own list has 101 movements. Only run against a simulated stream on one computer | Wrong or missing marker names if the real codes differ; LSL discovery across two machines is untested | Run it once with the real script on two computers; compare `events.tsv` with the script's `logs/stim_log_*.csv`, which holds the movement code and key of every event |
 
 ## Markers from the stimulus PC
 
-`eeg_emg_v3.py` publishes int32 LSL codes: `10000·phase + 1000·arm + 100·orientation + movement`. The interface listens to `stimulus_stream` (`stim_listener_task()`):
+`eeg_emg_v3.py` publishes int32 LSL codes: `baseline 1 through 6 : orientation, plus 3 if hand starts closed`. The interface listens to `stimulus_stream` (`stim_listener_task()`):
 
 | Code | Effect |
 |---|---|
