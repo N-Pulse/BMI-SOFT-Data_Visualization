@@ -1387,6 +1387,96 @@ def _select_xdf_data_stream(streams):
 
     return best
 
+def _xdf_events(streams, data_stream):
+    """Turn the stimulus marker stream of an XDF file into replay events."""
+    # Time zero = first sample of the signal, so event onsets line up with it.
+    stamps0 = np.asarray(data_stream.get("time_stamps", []), dtype=float)
+    t0 = float(stamps0[0]) if stamps0.size else 0.0
+    events = []
+    for stream in streams or []:
+        if stream is data_stream:
+            continue
+        info = stream.get("info", {})
+        name = str((info.get("name") or [""])[0])
+        if name != STIM_LSL_NAME:          # only the stimulus PC marker stream
+            continue
+        times = np.asarray(stream.get("time_stamps", []), dtype=float)
+        armed, open_evt = False, None
+        for stamp, sample in zip(times, stream.get("time_series", [])):
+            try:
+                code = int(float(sample[0]))
+            except (TypeError, ValueError, IndexError):
+                continue
+            onset = float(stamp - t0)
+            phase, arm, baseline, movement = decode_stim_code(code)
+            if phase == 5:                 # move code
+                if armed and onset >= 0:   # only right after a prep code
+                    orientation = ((baseline - 1) % 3) + 1 if baseline else 0
+                    open_evt = {
+                        "onset": onset, "duration": 0.0,
+                        "label": MOVEMENT_NAMES.get(movement, f"movement_{movement}"),
+                        "description": (f"arm={ARMS.get(arm, '?')}; baseline={baseline}; "
+                                        f"orientation={ORIENTATIONS.get(orientation, '?')}"),
+                        "code": str(code),
+                    }
+                    events.append(open_evt)
+                    armed = False
+                continue
+            if open_evt is not None:       # next code closes the movement
+                open_evt["duration"] = max(0.0, onset - open_evt["onset"])
+                open_evt = None
+            armed = (phase == 3)           # prep code arms the next move
+    events.sort(key=lambda e: e["onset"])
+    return events
+def _xdf_trigger_events(data, sampling_rate):
+    """Fallback: read the phase triggers sampled in the last channel of the signal.
+
+    The amplifier records the Arduino triggers in an extra channel: 0 most of
+    the time, a one-sample pulse at each phase onset (1 cue / rest eyes open,
+    2 rest eyes closed, 3 prep, 5 move, 7 return, 9 ITI) and a 128 sync pulse
+    every second. The movement number is not in the value, so events are
+    labelled by block and repetition.
+    """
+    x = np.asarray(data[-1], dtype=float)
+    values = np.unique(x)
+    if len(values) > 400 or not np.all(values == np.round(values)):
+        return []                                   # last channel is not a trigger channel
+    rise = np.flatnonzero((x[1:] != 0) & (x[:-1] == 0)) + 1       # start of each pulse
+    pulses = [(int(i), int(x[i])) for i in rise if x[i] < 128]    # drop the sync pulse and 128+ artefacts
+    has_rest = any(v == 2 for _, v in pulses)
+
+    events, open_evt = [], None
+    block, rep, closed_seen, rest_open_done = 0, 0, False, False
+    for i, v in pulses:
+        code, v = divmod(v, 10) if v > 9 else (0, v)   # old files: 10 x movement code + phase
+        onset = i / sampling_rate
+        if open_evt is not None:                    # the next pulse ends the previous event
+            open_evt["duration"] = max(0.0, onset - open_evt["onset"])
+            open_evt = None
+        if v == 1 and has_rest and not rest_open_done:
+            rest_open_done = True                   # first 1 = start of eyes-open rest
+            open_evt = {"onset": onset, "duration": 0.0, "label": "rest eyes open",
+                        "description": "resting state (until the next trigger)",
+                        "code": "1"}
+            events.append(open_evt)
+        elif v == 2:                                # eyes-closed rest
+            closed_seen = True
+            open_evt = {"onset": onset, "duration": 0.0, "label": "rest eyes closed",
+                        "description": "resting state (until the next trigger, includes the block announcement)",
+                        "code": "2"}
+            events.append(open_evt)
+        elif v == 1:                                # a cue: start of a block
+            block += 1
+            rep = 0
+        elif v == 5:                                # move onset
+            rep += 1
+            open_evt = {"onset": onset, "duration": 0.0,
+                        "label": (f"{MOVEMENT_NAMES.get(code, 'move code ' + str(code))} (block {block}, rep {rep})" if code
+                            else f"move (block {block}, rep {rep})"),
+                        "description": f"block={block}; rep={rep}; trigger=5" + (f"; old_code={code}" if code else ""),
+                        "code": "5"}
+            events.append(open_evt)
+    return events
 
 def _load_simulation_from_xdf(path):
     """Load EEG/EMG data from XDF file"""
@@ -1447,7 +1537,7 @@ def _load_simulation_from_xdf(path):
         fallback='emg' if 'emg' in str((info.get("type") or [""])[0]).lower() else 'eeg'
     )
     stream_name = (info.get("name") or ["XDF stream"])[0]
-    return _build_simulation_payload(
+    payload = _build_simulation_payload(
         data,
         sampling_rate=sampling_rate,
         signal_type=inferred_type,
@@ -1455,6 +1545,8 @@ def _load_simulation_from_xdf(path):
         channel_names=channel_names,
         source_format='xdf'
     )
+    payload["events"] = (_xdf_events(streams, data_stream) or _xdf_trigger_events(data, sampling_rate))
+    return payload
 
 
 def _load_simulation_from_fif(path):
@@ -3034,12 +3126,11 @@ ORIENTATIONS = {1: "up", 2: "side", 3: "down"}
 MOVEMENT_NAMES = {
     1: "close_four_fingers", 2: "close_index", 3: "close_middle",
     4: "close_thumb_over_palm", 5: "close_pinky", 6: "close_ring",
-    9: "close_all_fingers", 12: "close_all_fingers",   # 9 = up, 12 = side/down
-    14: "grab_cup_5_fingers", 16: "pinch_pen_thumb_index",
-    17: "pinch_pen_all_fingers", 18: "open_four_fingers",
-    19: "open_index", 20: "open_middle", 21: "open_thumb_over_palm",
-    22: "open_pinky", 23: "open_pinky",                # 22 = up, 23 = side/down
-    24: "open_ring", 29: "wrist_dorsiflexion", 31: "wrist_palmarflexion",
+    12: "close_all_fingers", 14: "grab_cup_5_fingers",
+    16: "pinch_pen_thumb_index", 17: "pinch_pen_all_fingers",
+    18: "open_four_fingers", 19: "open_index", 20: "open_middle",
+    21: "open_thumb_over_palm", 23: "open_pinky", 24: "open_ring",
+    29: "wrist_dorsiflexion", 31: "wrist_palmarflexion",
     32: "wrist_palmarflexion_closed_hand", 33: "wrist_dorsiflexion_closed_hand",
     34: "wrist_rotation", 35: "open_thumb_over_fingers",
     36: "close_thumb_over_fingers", 37: "open_all_fingers",
@@ -3475,7 +3566,8 @@ def upload_simulation_data():
         return jsonify({
             "status": "success",
             "message": "Simulation data loaded successfully",
-            "metadata": metadata
+            "metadata": metadata,
+            "events": payload.get("events", [])
         })
         
     except ValueError as e:
