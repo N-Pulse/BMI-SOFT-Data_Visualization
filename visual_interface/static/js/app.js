@@ -438,11 +438,16 @@ const stackedLabelPlugin = {
 const eventOverlayPlugin = {
   id: 'eventOverlay',
   afterDatasetsDraw(chartInstance) {
-    if (!simulationEvents.length) return;
+    const liveEvents = markers
+      .filter(m => Number.isFinite(m.chartTime))
+      .map(m => ({ label: m.label, plotTime: m.chartTime }));
+    if (!simulationEvents.length && !liveEvents.length) return;
     const { ctx, chartArea, scales } = chartInstance;
     if (!ctx || !chartArea || !scales?.x) return;
 
-    const visible = getVisibleSimulationEvents(currentWindowStartSec, waveformWindowSec);
+    const windowEnd = currentWindowStartSec + waveformWindowSec;
+    const visible = getVisibleSimulationEvents(currentWindowStartSec, waveformWindowSec)
+      .concat(liveEvents.filter(e => e.plotTime >= currentWindowStartSec && e.plotTime <= windowEnd));
     if (!visible.length) return;
 
     ctx.save();
@@ -856,15 +861,25 @@ function uploadEEGFile() {
     .then(parseJsonResponse)
     .then(data => {
       if (data.status === 'success') {
-        const metadata = data.metadata;
-        simulationDurationSec = Number(metadata.duration_seconds) || 0;
-        fileStatus.innerHTML = `
-          <strong>✓ File loaded successfully!</strong><br>
-          Channels: ${metadata.num_channels}<br>
-          Duration: ${metadata.duration_seconds}s<br>
-          Samples: ${metadata.num_samples}<br>
-          Sampling Rate: ${metadata.sampling_rate} Hz
-        `;
+          const metadata = data.metadata;
+          simulationDurationSec = Number(metadata.duration_seconds) || 0;
+          if (Array.isArray(data.events) && data.events.length) {
+            simulationEvents = data.events.map(evt => ({
+              onset: Number(evt.onset) || 0,
+              duration: Number(evt.duration) || 0,
+              label: evt.label || 'event',
+              description: evt.description || '',
+              code: evt.code || ''
+            }));
+          }
+          fileStatus.innerHTML = `
+            <strong>✓ File loaded successfully!</strong><br>
+            Channels: ${metadata.num_channels}<br>
+            Duration: ${metadata.duration_seconds}s<br>
+            Samples: ${metadata.num_samples}<br>
+            Sampling Rate: ${metadata.sampling_rate} Hz<br>
+            Events: ${(data.events || []).length}
+          `;
         fileStatus.style.color = '#4CAF50';
         renderWaveform();
         renderMarkers();
@@ -1258,7 +1273,13 @@ socket.on('stim_listener', d => {
 // Called when a marker opens, and again when it closes (same `time` value).
 socket.on('stim_marker', m => {
   const idx = markers.findIndex(x => x.time === m.time);
-  if (idx >= 0) markers[idx] = m; else markers.push(m);
+  if (idx >= 0) {
+    m.chartTime = markers[idx].chartTime;   // update (duration): keep the place chosen at onset
+    markers[idx] = m;
+  } else {
+    m.chartTime = lastSampleTimestamp;      // new marker: place it at the newest sample
+    markers.push(m);
+  }
   renderMarkers();
 });
 
