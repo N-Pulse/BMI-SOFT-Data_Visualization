@@ -17,6 +17,7 @@ import sys
 import types
 import importlib.util
 import csv
+import re
 from pathlib import Path
 
 # Configure logging for detailed information during execution
@@ -87,9 +88,9 @@ def create_brainflow_params():
 # enabled_channels — how many channels to read and stream.
 #   • PiEEG board          → up to 8
 #   • DSI-24 headset       → up to 24
-#   • Standard 64-ch cap   → up to 64
+#   • High-density cap     → up to 128 (N-Pulse uses caps up to 128 ch)
 #   The default is 8 (matches the PiEEG hardware we currently have).
-MAX_CHANNELS     = 64  # hard upper limit for EEG channels (/update-settings)
+MAX_CHANNELS     = 128  # hard upper limit for EEG channels (/update-settings)
 MAX_EMG_CHANNELS = 16  # hard upper limit for EMG channels (N-Pulse bracelet)
 enabled_channels = 8
 ref_enabled = True           # whether the REF electrode is active (PiEEG)
@@ -136,6 +137,17 @@ hardware_source = "pieeg"  # pieeg | dsi_lsl
 lsl_stream_type = os.environ.get("DSI_LSL_TYPE", "EEG")
 lsl_stream_name = os.environ.get("DSI_LSL_NAME", "")
 lsl_resolve_timeout = float(os.environ.get("DSI_LSL_TIMEOUT", "8"))
+# Which channels of the LSL stream are EEG and which are EMG (1-based, e.g. "1-128",
+# "135-139,141-143"). Needed when one amplifier stream carries both (CHUV eegoSports:
+# 1-128 EEG, 129-176 bipolar EMG/AUX inputs, 177 TRIGGER). Empty EMG = no EMG.
+lsl_eeg_channels = os.environ.get("EEG_LSL_CHANNELS", "auto")
+lsl_emg_channels = os.environ.get("EMG_LSL_CHANNELS", "auto")
+# Column of the amplifier stream that carries the Arduino triggers (CHUV: 177).
+# Empty = no live markers from the stream.
+# "auto" (default for all three) = detected from the first seconds of data
+# (see detect_channel_layout); an explicit list always wins.
+CHANNEL_DETECT_SECONDS = 2.0
+lsl_trigger_channel = os.environ.get("TRIGGER_LSL_CHANNEL", "auto")
 
 # EMG hardware backend: Upside Down Labs Chords firmware on Arduino UNO R4.
 # Leave EMG_SERIAL_PORT empty to auto-detect (/dev/ttyACM*, COM*, etc.).
@@ -306,13 +318,18 @@ def find_emg_serial_port():
     raise RuntimeError(f"Could not auto-detect Arduino serial port. Available ports: {available}. Set EMG_SERIAL_PORT manually.")
 
 
-def read_chords_packet(ser):
+CHORDS_NO_PACKET_TIMEOUT = 3.0  # s without a valid packet -> stop with an error
+
+
+def read_chords_packet(ser, deadline=None):
     """Read one binary packet emitted by the Chords UNO-R4 firmware.
 
     Packet format: 0xC7 0x7C counter [ch1_hi ch1_lo ... ch6_hi ch6_lo] 0x01.
     Returns a list of uint16 ADC values, or None on timeout.
     """
     while running:
+        if deadline is not None and time.time() > deadline:
+            return None
         first = ser.read(1)
         if not first:
             return None
@@ -616,7 +633,8 @@ def apply_baseline_correction(data_transposed):
         logging.error(f"Baseline correction failed: {e}")
     return data_transposed
 
-def process_and_emit_chunk(data_transposed, sampling_rate, acquisition_ts=None, signal_type=None):
+def process_and_emit_chunk(data_transposed, sampling_rate, acquisition_ts=None, signal_type=None,
+                           display_channels=None):
     """Central processing pipeline shared by every acquisition path.
 
     This function is the single place where raw samples go through the full
@@ -646,6 +664,9 @@ def process_and_emit_chunk(data_transposed, sampling_rate, acquisition_ts=None, 
     signal_type     : str or None — 'eeg', 'emg', 'motion'.  Overrides the
                       global current_signal_type.  Required in dual-stream
                       mode so each thread identifies its own signal correctly.
+    display_channels: int or None — how many channels to show (Enabled Channels).
+                      The recording buffer always keeps every channel; only the
+                      live view, rolling buffer, QC and features are cut.
     """
     if data_transposed is None or data_transposed.size == 0:
         return
@@ -661,6 +682,9 @@ def process_and_emit_chunk(data_transposed, sampling_rate, acquisition_ts=None, 
         processed = apply_smoothing(processed)
         processed, effective_rate = apply_downsampling(processed, sampling_rate)
 
+        all_channels = processed.tolist()
+        if display_channels and processed.shape[0] > display_channels:
+            processed = processed[:display_channels]
         data_for_frontend = processed.tolist()
 
         # --- Buffer routing ---
@@ -670,10 +694,10 @@ def process_and_emit_chunk(data_transposed, sampling_rate, acquisition_ts=None, 
         # export a BIDS-compliant EDF for each signal independently.
         if sig == 'emg' and dual_stream_mode:
             update_emg_collected_buffer(data_for_frontend, effective_rate)
-            buffer_emg_recording_data(data_for_frontend, effective_rate)
+            buffer_emg_recording_data(all_channels, effective_rate)
         else:
             update_collected_buffer(data_for_frontend, effective_rate)
-            buffer_recording_data(data_for_frontend, effective_rate)
+            buffer_recording_data(all_channels, effective_rate)
 
         # --- Emit to frontend ---
         # 'emg_data' drives the second chart panel; 'eeg_data' drives the first.
@@ -1442,7 +1466,8 @@ def _xdf_trigger_events(data, sampling_rate):
     if len(values) > 400 or not np.all(values == np.round(values)):
         return []                                   # last channel is not a trigger channel
     rise = np.flatnonzero((x[1:] != 0) & (x[:-1] == 0)) + 1       # start of each pulse
-    pulses = [(int(i), int(x[i])) for i in rise if x[i] < 128]    # drop the sync pulse and 128+ artefacts
+    # 128 = sync pulse; 128 + code = a phase pulse that coincided with it -> keep the code
+    pulses = [(int(i), int(x[i]) - 128 if x[i] > 128 else int(x[i])) for i in rise if x[i] != 128]
     has_rest = any(v == 2 for _, v in pulses)
 
     events, open_evt = [], None
@@ -1833,6 +1858,25 @@ def _score_signal_filename(filename):
     return base
 
 
+def replay_channel_split(data_arrays, sampling_rate, channel_names=None):
+    """EEG and EMG columns of a replayed file, from the EEG/EMG/trigger fields.
+
+    'auto' fields are detected on the first seconds of the file. Returns ([], [])
+    when no EMG column is set or found (replay everything as before).
+    """
+    num_channels = len(data_arrays)
+    if not channel_spec_is_set(lsl_emg_channels):
+        return [], []
+    n = min(len(ch) for ch in data_arrays)
+    head = int(min(n, max(CHANNEL_DETECT_SECONDS, 3.0) * sampling_rate))
+    block = np.array([np.asarray(ch[:head], dtype=float) for ch in data_arrays])
+    eeg_idx, emg_idx, trig_idx, text, detected = resolve_channel_split(num_channels, block, channel_names)
+    socketio.emit('channel_layout', {"status": "detected" if detected else "manual", "text": text})
+    if not emg_idx:
+        return [], []
+    return eeg_idx, emg_idx
+
+
 def read_eeg_data_file_simulation():
     """Replay a loaded recording file in real time with pause and seek support.
 
@@ -1875,15 +1919,16 @@ def read_eeg_data_file_simulation():
             raise ValueError("Uploaded EEG file contains empty channels")
 
         # Limit to the number of channels the UI is configured to show
+        # All channels are replayed and recorded; only the first target_channels are displayed
         target_channels = 3 if current_signal_type == 'motion' else max(1, int(enabled_channels))
+        # Same EEG / EMG columns as the live LSL stream (e.g. CHUV .xdf: 177 columns)
+        eeg_idx, emg_idx = replay_channel_split(
+            data_arrays, file_sampling_rate, metadata.get('channel_names'))
         if num_channels > target_channels:
             logging.info(
-                "Uploaded file has %s channels; streaming first %s for real-time view",
+                "Uploaded file has %s channels; displaying first %s (all are recorded)",
                 num_channels, target_channels
             )
-            data_arrays = data_arrays[:target_channels]
-            num_channels = target_channels
-            channel_lengths = channel_lengths[:target_channels]
 
         # Align all channels to the shortest length so indexing is always valid
         total_samples = min(channel_lengths)
@@ -1927,6 +1972,10 @@ def read_eeg_data_file_simulation():
             simulation_loaded_data.get('metadata', {}).get('channel_names') or
             [f'CH{i+1}' for i in range(num_channels)]
         )
+        if len(channel_names) < num_channels:   # e.g. 65 names for 177 columns
+            channel_names = list(channel_names) + [f'CH{i+1}' for i in range(len(channel_names), num_channels)]
+        main_idx = emg_idx if current_signal_type == 'emg' and emg_idx else (eeg_idx or list(range(num_channels)))
+        channel_names = [channel_names[i] for i in main_idx]
         socketio.emit('playback_info', {
             'total_samples':   total_samples,
             'total_time_sec':  total_samples / file_sampling_rate,
@@ -1985,7 +2034,18 @@ def read_eeg_data_file_simulation():
 
             data_transposed = np.array(chunk_data)
             acquisition_ts  = time.time()
-            process_and_emit_chunk(data_transposed, file_sampling_rate, acquisition_ts=acquisition_ts)
+            if current_signal_type == 'emg' and emg_idx:
+                process_and_emit_chunk(data_transposed[emg_idx], file_sampling_rate, acquisition_ts=acquisition_ts,
+                                       signal_type='emg', display_channels=target_channels)
+            elif eeg_idx:
+                process_and_emit_chunk(data_transposed[eeg_idx], file_sampling_rate, acquisition_ts=acquisition_ts,
+                                       signal_type=current_signal_type, display_channels=target_channels)
+                if dual_stream_mode and emg_idx:
+                    process_and_emit_chunk(data_transposed[emg_idx], file_sampling_rate, acquisition_ts=acquisition_ts,
+                                           signal_type='emg', display_channels=max(1, int(emg_enabled_channels)))
+            else:
+                process_and_emit_chunk(data_transposed, file_sampling_rate, acquisition_ts=acquisition_ts,
+                                       display_channels=target_channels)
 
             # ── Progress event ───────────────────────────────────────────────
             # Sent every chunk so the frontend scrubber thumb stays in sync.
@@ -2145,7 +2205,8 @@ def read_emg_data_chords_serial(dual_stream=False):
 
         port = find_emg_serial_port()
         logging.info("Opening EMG Arduino serial port %s @ %s baud", port, emg_baud_rate)
-        ser = serial.Serial(port, emg_baud_rate, timeout=1)
+        # exclusive: fail at once if another program already reads this port (POSIX)
+        ser = serial.Serial(port, emg_baud_rate, timeout=1, exclusive=True)
 
         # UNO R4 native USB can reset when the serial port opens.
         time.sleep(2.0)
@@ -2158,8 +2219,9 @@ def read_emg_data_chords_serial(dual_stream=False):
         update_filter_coefficients(hw_rate)
         current_stream_sampling_rate = hw_rate / downsample_factor if downsample_factor > 0 else hw_rate
         samples_per_chunk = compute_chunk_size(hw_rate)
-        channel_count = emg_enabled_channels if dual_stream else enabled_channels
-        channel_count = max(1, min(int(channel_count), emg_chords_channels))
+        display_count = emg_enabled_channels if dual_stream else enabled_channels
+        display_count = max(1, min(int(display_count), emg_chords_channels))
+        channel_count = emg_chords_channels  # every channel is recorded
         chunk = [[] for _ in range(channel_count)]
 
         logging.info(
@@ -2167,12 +2229,20 @@ def read_emg_data_chords_serial(dual_stream=False):
             channel_count, hw_rate, samples_per_chunk
         )
 
+        last_valid = time.time()
         while running and (not dual_stream or dual_stream_mode):
-            values = read_chords_packet(ser)
+            values = read_chords_packet(ser, deadline=last_valid + CHORDS_NO_PACKET_TIMEOUT)
             if values is None:
+                if time.time() - last_valid > CHORDS_NO_PACKET_TIMEOUT:
+                    raise RuntimeError(
+                        f"No valid Chords packet on {port} for {CHORDS_NO_PACKET_TIMEOUT:.0f} s. "
+                        f"Is this the EMG bracelet? Check baud ({emg_baud_rate}), "
+                        f"EMG_CHANNELS ({emg_chords_channels}) and that no other program uses the port."
+                    )
                 continue
+            last_valid = time.time()
 
-            # Keep only the channels displayed in the UI. The firmware sends uint16
+            # Keep every channel (display is cut later). The firmware sends uint16
             # 14-bit ADC counts, normally centered around Vcc/2; subtracting 8192
             # makes the waveform zero-centered and easier to visualize as EMG.
             for idx in range(channel_count):
@@ -2184,7 +2254,8 @@ def read_emg_data_chords_serial(dual_stream=False):
                     data_transposed,
                     hw_rate,
                     acquisition_ts=time.time(),
-                    signal_type='emg'
+                    signal_type='emg',
+                    display_channels=display_count
                 )
                 chunk = [[] for _ in range(channel_count)]
 
@@ -2259,6 +2330,143 @@ def read_eeg_data_brainflow():
             logging.error(f"Error stopping BrainFlow session: {e}")
 
 
+def parse_channel_spec(spec, n_channels=None):
+    """'1-128' / '135-139,141-143' (1-based) -> sorted 0-based indices.
+
+    With n_channels, indices beyond the stream are dropped. Raises ValueError on bad syntax.
+    """
+    indices = set()
+    for part in str(spec or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            start, end = int(a), int(b)
+        else:
+            start = end = int(part)
+        if start < 1 or end < start:
+            raise ValueError(f"Invalid channel range '{part}' (1-based, start <= end)")
+        indices.update(range(start - 1, end))
+    if n_channels is not None:
+        indices = {i for i in indices if i < n_channels}
+    return sorted(indices)
+
+
+def is_auto(spec):
+    return str(spec or "").strip().lower() == "auto"
+
+
+def channel_spec_is_set(spec):
+    """True for 'auto' or a non-empty valid list."""
+    return is_auto(spec) or bool(parse_channel_spec(spec))
+
+
+def format_channel_spec(indices):
+    """0-based indices -> compact 1-based text, e.g. [134,135,136,140] -> '135-137,141'."""
+    parts, run = [], []
+    for i in sorted(indices):
+        if run and i == run[-1] + 1:
+            run.append(i)
+            continue
+        if run:
+            parts.append(f"{run[0] + 1}-{run[-1] + 1}" if len(run) > 1 else f"{run[0] + 1}")
+        run = [i]
+    if run:
+        parts.append(f"{run[0] + 1}-{run[-1] + 1}" if len(run) > 1 else f"{run[0] + 1}")
+    return ",".join(parts)
+
+
+def _is_trigger_column(x):
+    """Integer values, almost always 0, few distinct values (Arduino pulses / sync)."""
+    if x.size == 0 or not np.all(np.isfinite(x)) or not np.all(x == np.round(x)):
+        return False
+    return np.mean(x == 0) >= 0.9 and len(np.unique(x)) <= 300
+
+
+def detect_channel_layout(data, channel_names=None, channel_types=None):
+    """Guess the EEG, EMG and trigger columns from a few seconds of data.
+
+    data: (channels, samples). Rules, as in the QC script:
+    - trigger: the last column with integer values that is 0 most of the time
+    - EEG: columns typed 'EEG' when the stream names every channel; otherwise
+      the first 256/128/64/32 columns (standard caps), or all of them for a small stream
+    - EMG: the remaining columns that carry a signal; unplugged inputs are flat
+      (or float far above the EEG level) and are left out
+    Returns dict(eeg, emg, trigger, text) with 0-based index lists.
+    """
+    data = np.asarray(data, dtype=float)
+    n = data.shape[0]
+    names = list(channel_names or [])
+    types = [str(t or "").lower() for t in (channel_types or [])]
+    full_meta = len(names) == n and len(types) == n and any(types)
+
+    trig = [i for i in range(n) if _is_trigger_column(data[i])]
+    trig_nonzero = [i for i in trig if np.any(data[i] != 0)]
+    named_trig = [i for i in range(len(names)) if "trig" in str(names[i]).lower()] if len(names) == n else []
+    trigger = (named_trig or trig_nonzero or ([n - 1] if (n - 1) in trig else []))[-1:]
+
+    others = [i for i in range(n) if i not in trigger]
+    if full_meta:
+        eeg = [i for i in others if types[i] == "eeg"]
+        candidates = [i for i in others if i not in eeg and types[i] in ("emg", "bip", "bipolar", "aux", "exg", "")]
+    else:
+        n_eeg = next((k for k in (256, 128, 64, 32) if len(others) > k), len(others))
+        eeg, candidates = others[:n_eeg], others[n_eeg:]
+
+    # "Has a signal": high-frequency amplitude (MAD of the first difference, offset-free)
+    def hf_amp(x):
+        d = np.diff(x)
+        return float(np.median(np.abs(d - np.median(d)))) if d.size else 0.0
+    eeg_level = np.median([hf_amp(data[i]) for i in eeg]) if eeg else 0.0
+    emg = []
+    for i in candidates:
+        a = hf_amp(data[i])
+        if eeg_level > 0:
+            plugged = 0.05 * eeg_level < a < 100 * eeg_level
+        else:
+            plugged = a > 0
+        if plugged and not _is_trigger_column(data[i]):
+            emg.append(i)
+
+    text = (f"EEG {format_channel_spec(eeg) or 'none'} · EMG {format_channel_spec(emg) or 'none'} · "
+            f"Trigger {format_channel_spec(trigger) or 'none'}")
+    return {"eeg": eeg, "emg": emg, "trigger": trigger, "text": text}
+
+
+def _lsl_channel_metadata(inlet, n_channels):
+    """Channel labels and types from the stream description, if the sender wrote them."""
+    names, types = [], []
+    try:
+        ch = inlet.info(timeout=2.0).desc().child("channels").child("channel")
+        for _ in range(n_channels):
+            if ch.empty():
+                break
+            names.append(ch.child_value("label"))
+            types.append(ch.child_value("type"))
+            ch = ch.next_sibling()
+    except Exception:
+        pass
+    return names, types
+
+
+def resolve_channel_split(n_channels, data=None, names=None, types=None):
+    """Apply the EEG / EMG / trigger fields; 'auto' fields are taken from detection."""
+    layout = None
+    if any(is_auto(s) for s in (lsl_eeg_channels, lsl_emg_channels, lsl_trigger_channel)) and data is not None:
+        layout = detect_channel_layout(data, names, types)
+    def pick(spec, key):
+        if is_auto(spec):
+            return list(layout[key]) if layout else []
+        return parse_channel_spec(spec, n_channels)
+    eeg_idx = pick(lsl_eeg_channels, "eeg")
+    emg_idx = pick(lsl_emg_channels, "emg")
+    trig_idx = pick(lsl_trigger_channel, "trigger")[:1]
+    eeg_idx = [i for i in eeg_idx if i not in emg_idx and i not in trig_idx]
+    text = (f"EEG {format_channel_spec(eeg_idx) or 'none'} · EMG {format_channel_spec(emg_idx) or 'none'} · "
+            f"Trigger {format_channel_spec(trig_idx) or 'none'}")
+    return eeg_idx, emg_idx, trig_idx, text, layout is not None
+
+
 def _resolve_lsl_eeg_stream():
     """Resolve target LSL stream for DSI hardware mode"""
     try:
@@ -2298,9 +2506,16 @@ def _resolve_lsl_eeg_stream():
 
 
 def read_eeg_data_lsl():
-    """Read EEG data from LSL stream and emit to frontend"""
+    """Read the amplifier LSL stream and emit EEG and/or EMG to the frontend.
+
+    lsl_eeg_channels / lsl_emg_channels pick the columns of each modality:
+    - signal type EEG: EEG columns (plus EMG columns in dual-stream mode)
+    - signal type EMG: EMG columns only
+    Every selected column is recorded; Enabled Channels only limits the display.
+    """
     global running, current_stream_sampling_rate
     inlet = None
+    trigger = None
     try:
         from pylsl import StreamInlet
 
@@ -2310,22 +2525,58 @@ def read_eeg_data_lsl():
         if hw_rate <= 0:
             hw_rate = float(fs)
 
+        n_channels = int(info.channel_count())
+        pending = []   # chunks read during detection, processed afterwards (nothing is lost)
+        sample_block = None
+        if any(is_auto(s) for s in (lsl_eeg_channels, lsl_emg_channels, lsl_trigger_channel)):
+            socketio.emit('channel_layout', {"status": "detecting",
+                                             "text": f"Detecting channels ({n_channels} in the stream)..."})
+            need = int(CHANNEL_DETECT_SECONDS * hw_rate)
+            got = 0
+            deadline = time.time() + CHANNEL_DETECT_SECONDS + 10
+            while running and got < need and time.time() < deadline:
+                chunk, _ = inlet.pull_chunk(timeout=1.0, max_samples=1024)
+                if chunk:
+                    arr = np.asarray(chunk, dtype=np.float32)
+                    pending.append(arr)
+                    got += arr.shape[0]
+            if pending:
+                sample_block = np.concatenate(pending, axis=0).T
+        names, types = _lsl_channel_metadata(inlet, n_channels)
+        eeg_idx, emg_idx, trig_idx, layout_text, detected = resolve_channel_split(
+            n_channels, sample_block, names, types)
+        if not eeg_idx:
+            eeg_idx = list(range(n_channels))
+        socketio.emit('channel_layout', {"status": "detected" if detected else "manual", "text": layout_text,
+                                         "eeg": format_channel_spec(eeg_idx), "emg": format_channel_spec(emg_idx),
+                                         "trigger": format_channel_spec(trig_idx)})
+        trigger = LiveTriggerDecoder() if trig_idx else None
+        emg_only = current_signal_type == 'emg'
+        with_emg = emg_only or dual_stream_mode
+        if with_emg and not emg_idx:
+            raise RuntimeError(
+                f"No EMG channel found in the LSL stream ({n_channels} channels; {layout_text}). "
+                "Enter 'EMG channels', e.g. 135-139,141-143."
+            )
+
         update_filter_coefficients(hw_rate)
         current_stream_sampling_rate = hw_rate / downsample_factor if downsample_factor > 0 else hw_rate
         samples_per_chunk = compute_chunk_size(hw_rate)
         logging.info(
-            "LSL stream connected: name=%s type=%s channels=%s nominal_srate=%s",
-            info.name(),
-            info.type(),
-            info.channel_count(),
-            info.nominal_srate()
+            "LSL stream connected: name=%s type=%s channels=%s nominal_srate=%s | EEG cols=%s EMG cols=%s trigger col=%s",
+            info.name(), info.type(), n_channels, info.nominal_srate(),
+            0 if emg_only else len(eeg_idx), len(emg_idx) if with_emg else 0,
+            trig_idx[0] + 1 if trig_idx else "none"
         )
 
         while running:
-            chunk, _ = inlet.pull_chunk(timeout=1.0, max_samples=max(samples_per_chunk, 32))
-            if not chunk:
-                continue
-            arr = np.asarray(chunk, dtype=np.float32)
+            if pending:
+                arr = pending.pop(0)
+            else:
+                chunk, _ = inlet.pull_chunk(timeout=1.0, max_samples=max(samples_per_chunk, 32))
+                if not chunk:
+                    continue
+                arr = np.asarray(chunk, dtype=np.float32)
             if arr.ndim == 1:
                 arr = arr[:, np.newaxis]
             if arr.ndim != 2 or arr.size == 0:
@@ -2333,17 +2584,28 @@ def read_eeg_data_lsl():
 
             # LSL chunk shape [samples, channels] -> [channels, samples]
             data_transposed = arr.T
-            target_channels = max(1, int(enabled_channels))
-            if data_transposed.shape[0] > target_channels:
-                data_transposed = data_transposed[:target_channels, :]
-
-            process_and_emit_chunk(data_transposed, hw_rate, acquisition_ts=time.time())
+            acquisition_ts = time.time()
+            if trigger is not None:
+                for marker in trigger.feed(data_transposed[trig_idx[0]], acquisition_ts, hw_rate):
+                    socketio.emit('stim_marker', dict(marker))
+            if emg_only:
+                process_and_emit_chunk(data_transposed[emg_idx], hw_rate, acquisition_ts=acquisition_ts,
+                                       signal_type='emg', display_channels=max(1, int(enabled_channels)))
+                continue
+            process_and_emit_chunk(data_transposed[eeg_idx], hw_rate, acquisition_ts=acquisition_ts,
+                                   signal_type='eeg', display_channels=max(1, int(enabled_channels)))
+            if dual_stream_mode:
+                process_and_emit_chunk(data_transposed[emg_idx], hw_rate, acquisition_ts=acquisition_ts,
+                                       signal_type='emg', display_channels=max(1, int(emg_enabled_channels)))
 
     except Exception as e:
         logging.error(f"LSL stream error: {e}")
         running = False
         socketio.emit('error', {'message': f"LSL stream error: {str(e)}"})
     finally:
+        if trigger is not None:
+            for marker in trigger.close(time.time()):
+                socketio.emit('stim_marker', dict(marker))
         try:
             if inlet is not None:
                 inlet.close_stream()
@@ -2479,7 +2741,11 @@ def create_bids_edf(data, subject_id='01', task='resting', run='01', sampling_ra
     
     try:
         # Export to EDF format
-        mne.export.export_raw(edf_filename, raw, fmt='edf', overwrite=True)
+        # channelwise: each channel gets its own physical range. With the default
+        # (one range per channel type) a single channel with a large offset or drift
+        # leaves the others only a few 16-bit steps, so they look flat on replay.
+        mne.export.export_raw(edf_filename, raw, fmt='edf', overwrite=True,
+                              physical_range='channelwise')
         
         # Read the EDF file as bytes
         with open(edf_filename, 'rb') as edf_file:
@@ -2701,22 +2967,41 @@ def get_hardware_source():
     return jsonify({
         "hardware_source": hardware_source,
         "lsl_stream_type": lsl_stream_type,
-        "lsl_stream_name": lsl_stream_name
+        "lsl_stream_name": lsl_stream_name,
+        "lsl_eeg_channels": lsl_eeg_channels,
+        "lsl_emg_channels": lsl_emg_channels,
+        "lsl_trigger_channel": lsl_trigger_channel
     })
 
 
 @app.route('/set-hardware-source', methods=['POST'])
 def set_hardware_source():
     """Switch hardware backend (PiEEG vs DSI-LSL)"""
-    global hardware_source
+    global hardware_source, lsl_eeg_channels, lsl_emg_channels, lsl_trigger_channel
     if running:
         return jsonify({"status": "error", "message": "Stop analysis before changing hardware source"}), 409
     payload = request.get_json(silent=True) or {}
     source = str(payload.get("hardware_source", hardware_source)).strip().lower()
     if source not in ("pieeg", "dsi_lsl"):
         return jsonify({"status": "error", "message": "Invalid hardware source"}), 400
+    eeg_spec = str(payload.get("lsl_eeg_channels", lsl_eeg_channels)).strip() or "auto"
+    emg_spec = str(payload.get("lsl_emg_channels", lsl_emg_channels)).strip()
+    trig_spec = str(payload.get("lsl_trigger_channel", lsl_trigger_channel)).strip()
+    try:
+        for spec in (eeg_spec, emg_spec):
+            if not is_auto(spec):
+                parse_channel_spec(spec)
+        if not is_auto(trig_spec) and len(parse_channel_spec(trig_spec)) > 1:
+            raise ValueError("Trigger channel: give a single channel number (e.g. 177) or 'auto'")
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
     hardware_source = source
-    return jsonify({"status": "ok", "hardware_source": hardware_source})
+    lsl_eeg_channels = eeg_spec
+    lsl_emg_channels = emg_spec
+    lsl_trigger_channel = trig_spec
+    return jsonify({"status": "ok", "hardware_source": hardware_source,
+                    "lsl_eeg_channels": lsl_eeg_channels, "lsl_emg_channels": lsl_emg_channels,
+                    "lsl_trigger_channel": lsl_trigger_channel})
 
 
 @app.route('/toggle-dual-mode', methods=['POST'])
@@ -2780,9 +3065,12 @@ def start_analysis():
             logging.warning("MOTION hardware mode not supported yet")
             return jsonify({"status": "MOTION hardware mode is not supported. Enable simulation mode."}), 400
 
-        if current_signal_type == 'emg':
-            if dual_stream_mode:
-                return jsonify({"status": "error", "message": "For dual-stream hardware mode, select EEG as the main signal and enable Synchronized EEG + EMG. For EMG only, disable dual-stream."}), 400
+        if current_signal_type == 'emg' and dual_stream_mode:
+            return jsonify({"status": "error", "message": "For dual-stream hardware mode, select EEG as the main signal and enable Synchronized EEG + EMG. For EMG only, disable dual-stream."}), 400
+        if hardware_source == "dsi_lsl" and (current_signal_type == 'emg' or dual_stream_mode) \
+                and not channel_spec_is_set(lsl_emg_channels):
+            return jsonify({"status": "error", "message": "LSL source: set 'EMG channels (LSL)' (e.g. 135-139,141-143) before streaming EMG."}), 400
+        if current_signal_type == 'emg' and hardware_source != "dsi_lsl":
             logging.info("Starting analysis in HARDWARE mode (EMG via Arduino/Chords serial)")
             target = read_emg_data_chords_serial
         elif hardware_source == "dsi_lsl":
@@ -2798,7 +3086,7 @@ def start_analysis():
             except Exception as exc:
                 logging.error(f"LSL preflight failed: {exc}")
                 return jsonify({"status": "error", "message": f"DSI LSL stream is not ready: {str(exc)}"}), 400
-            logging.info("Starting analysis in HARDWARE mode (DSI via LSL)")
+            logging.info("Starting analysis in HARDWARE mode (LSL, signal=%s, dual=%s)", current_signal_type, dual_stream_mode)
             target = read_eeg_data_lsl
         else:
             logging.info("Starting analysis in HARDWARE mode (PiEEG/BrainFlow)")
@@ -2826,9 +3114,15 @@ def start_analysis():
                 # Reset the EMG buffer to match the new number of channels
                 global emg_collected_data
                 emg_collected_data = [[] for _ in range(emg_enabled_channels)]
-            if simulation_mode:
+            if simulation_mode and simulation_loaded_data and channel_spec_is_set(lsl_emg_channels):
+                # EMG comes from the replayed file's columns, handled in read_eeg_data_file_simulation
+                logging.info("Dual-stream EMG from file columns %s", lsl_emg_channels)
+            elif simulation_mode:
                 socketio.start_background_task(read_emg_data_dual_simulation)
                 logging.info("Dual-stream EMG simulation thread started (%s channels)", emg_enabled_channels)
+            elif hardware_source == "dsi_lsl":
+                # EMG comes from the same LSL stream, handled in read_eeg_data_lsl
+                logging.info("Dual-stream EMG from LSL columns %s", lsl_emg_channels)
             else:
                 socketio.start_background_task(read_emg_data_chords_serial_dual)
                 logging.info("Dual-stream EMG hardware thread started (%s channels)", emg_enabled_channels)
@@ -3116,6 +3410,9 @@ def end_marker():
 # + 100*orientation + movement. Phases: cue 1, prep 3, move 5, return 7, ITI 9.
 # Phase 0 = special codes (9999, 8888, 9701, 9702, 8899).
 STIM_LSL_NAME = os.environ.get("STIM_LSL_NAME", "stimulus_stream")
+STIM_SERIAL_BAUD = int(os.environ.get("STIM_SERIAL_BAUD", "115200"))
+# Serial codes below this value are plain triggers (not the eeg_emg_v3 phase code)
+STIM_PHASE_CODE_MIN = 10000
 ARMS = {1: "left", 2: "right"}
 ORIENTATIONS = {1: "up", 2: "side", 3: "down"}
 # The digit sent after the arm is the baseline (1-6): orientation, plus 3 when
@@ -3187,8 +3484,96 @@ def handle_stim_code(code, unix_ts, state):
     return changed
 
 
-def stim_listener_task():
+def _finish_stim_listener(state, message):
+    """Close the open marker and tell the browser the listener stopped."""
     global stim_listener_running
+    open_marker = state.get("open")
+    if open_marker is not None:
+        with event_lock:
+            open_marker["duration"] = max(0.0, time.time() - open_marker["time"])
+        socketio.emit('stim_marker', dict(open_marker))
+    stim_listener_running = False
+    socketio.emit('stim_listener', {"status": "stopped", "message": message})
+
+
+class LiveTriggerDecoder:
+    """Turn the amplifier's TRIGGER column into markers while streaming.
+
+    Same rules as _xdf_trigger_events (replay): one-sample pulses 1 cue / rest
+    eyes open, 2 rest eyes closed, 3 prep, 5 move, 7 return, 9 ITI, 128 sync.
+    A marker opens on 'move', 'rest eyes closed' and the first 1 (rest eyes
+    open, as in the CHUV protocol) and closes at the next pulse. Markers are
+    stored only while recording, like the stimulus-PC listener.
+    """
+
+    def __init__(self):
+        self.last = 0.0
+        self.block = 0
+        self.rep = 0
+        self.rest_open_done = False
+        self.open = None
+
+    def _marker(self, label, description, code, unix_ts):
+        if not recording_active:
+            return None
+        marker = {
+            "label": label,
+            "description": f"{description}; trigger={code}",
+            "time": unix_ts,
+            "offset": max(0.0, unix_ts - recording_start_time) if recording_start_time else 0.0,
+            "duration": None,
+        }
+        with event_lock:
+            event_markers.append(marker)
+        return marker
+
+    def close(self, unix_ts):
+        if self.open is None:
+            return []
+        with event_lock:
+            self.open["duration"] = max(0.0, unix_ts - self.open["time"])
+        closed, self.open = self.open, None
+        return [closed]
+
+    def feed(self, column, end_unix_ts, sampling_rate):
+        """column: trigger samples of one chunk; returns markers opened or closed."""
+        x = np.asarray(column, dtype=float)
+        if x.size == 0:
+            return []
+        prev = np.concatenate(([self.last], x[:-1]))
+        self.last = float(x[-1])
+        changed = []
+        for i in np.flatnonzero((x != 0) & (prev == 0)):
+            v = int(round(x[i]))
+            if v >= 128:
+                v -= 128                      # sync pulse, possibly with a phase pulse on top
+            if v <= 0:
+                continue
+            code, phase = divmod(v, 10) if v > 9 else (0, v)   # old files: 10 x movement + phase
+            unix_ts = end_unix_ts - (x.size - 1 - i) / sampling_rate
+            changed += self.close(unix_ts)    # any pulse ends the open event
+            marker = None
+            if phase == 1 and not self.rest_open_done:
+                self.rest_open_done = True
+                marker = self._marker("rest eyes open", "resting state (until the next trigger)", v, unix_ts)
+            elif phase == 1:
+                self.block += 1
+                self.rep = 0
+            elif phase == 2:
+                marker = self._marker("rest eyes closed", "resting state (until the next trigger)", v, unix_ts)
+            elif phase == 5:
+                self.rep += 1
+                name = MOVEMENT_NAMES.get(code, f"move code {code}") if code else "move"
+                marker = self._marker(f"{name} (block {self.block}, rep {self.rep})",
+                                      f"block={self.block}; rep={self.rep}", v, unix_ts)
+            if marker is not None:
+                self.open = marker
+                changed.append(marker)
+        return changed
+
+
+def stim_listener_task():
+    """Listen to the stimulus PC's LSL stream (eeg_emg_v3.py)."""
     state = {}
     message = "Stopped"
     try:
@@ -3218,24 +3603,136 @@ def stim_listener_task():
         logging.error("Stimulus listener error: %s", exc)
         message = str(exc)
     finally:
-        open_marker = state.get("open")
-        if open_marker is not None:
-            with event_lock:
-                open_marker["duration"] = max(0.0, time.time() - open_marker["time"])
-            socketio.emit('stim_marker', dict(open_marker))
-        stim_listener_running = False
-        socketio.emit('stim_listener', {"status": "stopped", "message": message})
+        _finish_stim_listener(state, message)
+
+
+def list_serial_ports():
+    """Return the serial ports pyserial can see, as dicts for the browser."""
+    try:
+        from serial.tools import list_ports
+    except ImportError as exc:
+        raise RuntimeError("pyserial is required. Install it with: pip install pyserial") from exc
+    return [{"device": p.device, "description": p.description or ""}
+            for p in list_ports.comports() if not _is_system_serial_port(p)]
+
+
+# Ports the OS always creates (macOS Bluetooth and debug consoles); never a stimulus device.
+SYSTEM_SERIAL_PORT_KEYWORDS = ("bluetooth", "debug-console", "wlan-debug")
+
+
+def _is_system_serial_port(port):
+    text = f"{port.device} {port.description or ''}".lower()
+    return any(k in text for k in SYSTEM_SERIAL_PORT_KEYWORDS)
+
+
+def resolve_stim_serial_port(port):
+    """Use the given port, or the only port present; refuse to guess between several."""
+    if port:
+        return port
+    ports = [p["device"] for p in list_serial_ports()]
+    if len(ports) == 1:
+        return ports[0]
+    if not ports:
+        raise RuntimeError("No serial port found. Plug in the stimulus device.")
+    raise RuntimeError(f"Several serial ports found ({', '.join(ports)}). Choose one.")
+
+
+def handle_serial_trigger(code, unix_ts):
+    """Plain trigger (code < STIM_PHASE_CODE_MIN): one instantaneous marker."""
+    if not recording_active:
+        return []
+    marker = {
+        "label": f"trigger_{code}",
+        "description": f"serial trigger; code={code}",
+        "time": unix_ts,
+        "offset": max(0.0, unix_ts - recording_start_time) if recording_start_time else 0.0,
+        "duration": 0.0,
+    }
+    with event_lock:
+        event_markers.append(marker)
+    return [marker]
+
+
+def stim_serial_task(port, baud):
+    """Listen to a stimulus device on a serial port.
+
+    Expects one integer code per line in ASCII (e.g. b"50312\n"). Codes from
+    STIM_PHASE_CODE_MIN up follow the eeg_emg_v3 scheme (handle_stim_code);
+    smaller codes are plain triggers. The time is taken on reception.
+    """
+    state = {}
+    message = "Stopped"
+    ser = None
+    try:
+        import serial
+        ser = serial.Serial(port, baud, timeout=0.2, exclusive=True)
+        ser.reset_input_buffer()
+        socketio.emit('stim_listener', {"status": "connected",
+                                        "message": f"Connected to {port} @ {baud} baud"})
+        while not stim_listener_stop.is_set():
+            line = ser.readline()
+            if not line:
+                continue
+            unix_ts = time.time()
+            match = re.search(rb"-?\d+", line)
+            if not match:
+                logging.warning("Stimulus serial: ignored line %r", line)
+                continue
+            code = int(match.group())
+            if code >= STIM_PHASE_CODE_MIN:
+                changed = handle_stim_code(code, unix_ts, state)
+            else:
+                changed = handle_serial_trigger(code, unix_ts)
+            for marker in changed:
+                socketio.emit('stim_marker', dict(marker))
+    except Exception as exc:
+        logging.error("Stimulus serial listener error: %s", exc)
+        message = str(exc)
+    finally:
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+        _finish_stim_listener(state, message)
+
+
+@app.route('/serial-ports', methods=['GET'])
+def serial_ports_route():
+    try:
+        return jsonify({"ports": list_serial_ports()})
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
 
 
 @app.route('/start-stim-listener', methods=['POST'])
 def start_stim_listener():
+    """Start the stimulus listener.
+
+    Body (optional): {"source": "lsl" | "serial", "port": "/dev/ttyACM0", "baud": 115200}
+    Without a body the LSL listener starts, as before.
+    """
     global stim_listener_running
     if stim_listener_running:
         return jsonify({"status": "error", "message": "Listener already running"}), 409
+    payload = request.get_json(silent=True) or {}
+    source = str(payload.get("source", "lsl")).strip().lower()
+    if source == "serial":
+        try:
+            port = resolve_stim_serial_port(str(payload.get("port") or "").strip())
+            baud = int(payload.get("baud") or STIM_SERIAL_BAUD)
+        except Exception as exc:
+            return jsonify({"status": "error", "message": str(exc)}), 400
+        stim_listener_stop.clear()
+        stim_listener_running = True
+        socketio.start_background_task(stim_serial_task, port, baud)
+        return jsonify({"status": "listening", "source": "serial", "port": port, "baud": baud})
+    if source != "lsl":
+        return jsonify({"status": "error", "message": "Invalid source"}), 400
     stim_listener_stop.clear()
     stim_listener_running = True
     socketio.start_background_task(stim_listener_task)
-    return jsonify({"status": "listening"})
+    return jsonify({"status": "listening", "source": "lsl"})
 
 
 @app.route('/stop-stim-listener', methods=['POST'])

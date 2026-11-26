@@ -6,10 +6,10 @@ const socket = io();
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Maximum number of EEG channels the UI supports.
-// Standard high-density EEG caps (e.g. 10–20 system, actiCAP) go up to 64.
+// N-Pulse uses high-density EEG caps with up to 128 channels.
 // The PiEEG board is limited to 8, but the DSI-24 headset uses 24 channels.
-// Setting this to 64 makes the code forward-compatible with any device we add.
-const MAX_EEG_CHANNELS = 64;
+// Setting this to 128 covers every cap we use.
+const MAX_EEG_CHANNELS = 128;
 
 // Maximum EMG channels — the upcoming N-Pulse bracelet prototype is expected
 // to provide 8–16 channels. 16 gives enough headroom for future revisions.
@@ -42,8 +42,8 @@ function generateColorPalette(count, hueOffset = 0, sat = 75, lightBase = 60) {
   });
 }
 
-// EEG channels — full hue wheel, 64 entries.
-// Each channel gets a distinct colour even at high density (e.g. 64-channel cap).
+// EEG channels — full hue wheel, one entry per MAX_EEG_CHANNELS.
+// Each channel gets a distinct colour even at high density (e.g. 128-channel cap).
 const channelColors = generateColorPalette(MAX_EEG_CHANNELS, 0, 75, 60);
 
 // EMG channels — offset by 160° so the EMG panel palette starts in the
@@ -163,6 +163,7 @@ document.addEventListener('DOMContentLoaded', () => {
   initializeFeatureCharts();
   updateSignalUI();
   updateSettings();
+  loadHardwareSource();
   loadMetadata();
   renderMarkers();
   renderSessionSummary();
@@ -644,6 +645,61 @@ function initializeFeatureCharts() {
   });
 }
 
+// ── Hardware source (PiEEG vs LSL) and LSL channel split ─────────────────────
+function showLslFields() {
+  // The channel split is used by the live LSL stream and by file replay
+  const lsl = document.getElementById('hardwareSource')?.value === 'dsi_lsl';
+  const fields = document.getElementById('lslChannelFields');
+  if (fields) fields.style.display = (lsl || isSimulationMode) ? '' : 'none';
+  // No hardware in simulation mode: hide the source selector (channel fields stay for replay)
+  const sourceField = document.getElementById('hardwareSourceField');
+  if (sourceField) sourceField.style.display = isSimulationMode ? 'none' : '';
+  const status = document.getElementById('hardwareSourceStatus');
+  if (status && isSimulationMode) status.textContent = '';
+}
+
+function loadHardwareSource() {
+  fetch('/hardware-source')
+    .then(parseJsonResponse)
+    .then(data => {
+      document.getElementById('hardwareSource').value = data.hardware_source || 'pieeg';
+      document.getElementById('lslEegChannels').value = data.lsl_eeg_channels || '';
+      document.getElementById('lslEmgChannels').value = data.lsl_emg_channels || '';
+      document.getElementById('lslTriggerChannel').value = data.lsl_trigger_channel || '';
+      showLslFields();
+    })
+    .catch(err => console.error('[client] hardware source:', err));
+}
+
+function saveHardwareSource() {
+  showLslFields();
+  const status = document.getElementById('hardwareSourceStatus');
+  fetch('/set-hardware-source', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      hardware_source: document.getElementById('hardwareSource').value,
+      lsl_eeg_channels: document.getElementById('lslEegChannels').value.trim(),
+      lsl_emg_channels: document.getElementById('lslEmgChannels').value.trim(),
+      lsl_trigger_channel: document.getElementById('lslTriggerChannel').value.trim()
+    })
+  })
+    .then(parseJsonResponse)
+    .then(data => { if (status) status.textContent = `Source: ${data.hardware_source}`; })
+    .catch(error => {
+      if (status) status.textContent = error.message || 'Could not change the hardware source';
+      loadHardwareSource();   // show what the server actually uses
+    });
+}
+
+// Channel split used by the server (detected when a field is 'auto')
+socket.on('channel_layout', d => {
+  const el = document.getElementById('channelLayoutStatus');
+  if (!el) return;
+  const prefix = d.status === 'detected' ? 'Detected: ' : d.status === 'manual' ? 'Channels: ' : '';
+  el.textContent = prefix + (d.text || '');
+});
+
 // Toggle simulation mode
 function toggleSimulation() {
   const toggle = document.getElementById('simulationToggle');
@@ -651,6 +707,7 @@ function toggleSimulation() {
   const fileUploadSection = document.getElementById('fileUploadSection');
 
   isSimulationMode = toggle.checked;
+  showLslFields();
 
   if (fileUploadSection) {
     fileUploadSection.style.display = isSimulationMode ? 'block' : 'none';
@@ -681,6 +738,7 @@ function toggleSimulation() {
       if (fileUploadSection) {
         fileUploadSection.style.display = isSimulationMode ? 'block' : 'none';
       }
+      showLslFields();
       alert('Error toggling simulation mode. Check console for details.');
     });
 }
@@ -748,10 +806,11 @@ function updateSignalUI() {
     chart.options.scales.y.title.text = getYAxisLabel();
     renderWaveform();
   }
+  configureFeatureBarChart();
 }
 
 function getYAxisLabel() {
-  if (currentSignalType === 'emg') return 'Amplitude (mV)';
+  if (currentSignalType === 'emg') return 'Amplitude (µV)';
   if (currentSignalType === 'motion') return 'Acceleration (a.u.)';
   return 'Amplitude (µV)';
 }
@@ -1250,12 +1309,49 @@ function setStimButtons(listening) {
   document.getElementById('stopStimBtn').disabled = !listening;
 }
 
-function startStimListener() {
-  fetch('/start-stim-listener', { method: 'POST' })
+function onStimSourceChange() {
+  const serial = document.getElementById('stimSource').value === 'serial';
+  document.getElementById('stimSerialOptions').style.display = serial ? '' : 'none';
+  if (serial) refreshStimPorts();
+}
+
+function refreshStimPorts() {
+  const select = document.getElementById('stimPort');
+  const previous = select.value;
+  fetch('/serial-ports')
     .then(parseJsonResponse)
-    .then(() => {
+    .then(data => {
+      select.innerHTML = '<option value="">Auto (only port)</option>';
+      (data.ports || []).forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.device;
+        opt.textContent = p.description ? `${p.device} (${p.description})` : p.device;
+        select.appendChild(opt);
+      });
+      if ([...select.options].some(o => o.value === previous)) select.value = previous;
+      if (!(data.ports || []).length) setStimStatus('No serial port found');
+    })
+    .catch(error => setStimStatus(error.message || 'Could not list serial ports'));
+}
+
+function startStimListener() {
+  const source = document.getElementById('stimSource')?.value || 'lsl';
+  const body = { source };
+  if (source === 'serial') {
+    body.port = document.getElementById('stimPort').value;
+    body.baud = parseInt(document.getElementById('stimBaud').value, 10) || 115200;
+  }
+  fetch('/start-stim-listener', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  })
+    .then(parseJsonResponse)
+    .then(data => {
       setStimButtons(true);
-      setStimStatus('Searching for the stimulus stream...');
+      setStimStatus(source === 'serial'
+        ? `Opening ${data.port} @ ${data.baud} baud...`
+        : 'Searching for the stimulus stream...');
     })
     .catch(error => alert(error.message || 'Could not start the listener'));
 }
@@ -2553,7 +2649,7 @@ function updateMetricsAndFeatures(channels, samplingRate) {
 
   const powerUnits = currentSignalType === 'motion' ? 'a.u.^2' : 'uV^2';
   setText('avgPower', `${avgPower.toFixed(1)} ${powerUnits}`);
-  const activationUnits = currentSignalType === 'emg' ? 'mV' : currentSignalType === 'motion' ? 'a.u.' : 'uV';
+  const activationUnits = currentSignalType === 'motion' ? 'a.u.' : 'uV';
   setText('activation', `${activation.toFixed(2)} ${activationUnits}`);
   setText('snr', snr.toFixed(2));
   setText('impedance', `${Math.round(quality * 100)}%`);
@@ -2656,6 +2752,44 @@ function computePSD(series, samplingRate) {
   return { freqs, power };
 }
 
+// ── Feature bar chart: EEG band power, or EMG RMS per channel ───────────────
+const EEG_BAND_LABELS = ['Delta (1-4)', 'Theta (4-8)', 'Alpha (8-13)', 'Beta (13-30)', 'Gamma (30-45)'];
+const EEG_BAND_COLORS = ['#7e57c2', '#42a5f5', '#66bb6a', '#ffa726', '#ef5350'];
+
+function configureFeatureBarChart() {
+  if (!bandPowerChart) return;
+  const ds = bandPowerChart.data.datasets[0];
+  const y = bandPowerChart.options.scales.y;
+  if (currentSignalType === 'emg') {
+    bandPowerChart.data.labels = [];
+    ds.label = 'RMS per channel (last chunk)';
+    ds.data = [];
+    ds.backgroundColor = '#26a69a';
+    y.title.text = 'RMS (µV)';
+    y.max = undefined;          // EMG amplitude varies a lot: autoscale
+  } else {
+    bandPowerChart.data.labels = [...EEG_BAND_LABELS];
+    ds.label = 'Band power (avg last chunk)';
+    ds.data = EEG_BAND_LABELS.map(() => 0);
+    ds.backgroundColor = [...EEG_BAND_COLORS];
+    y.title.text = currentSignalType === 'motion' ? 'Power (a.u.^2)' : 'Power (uV^2)';
+    y.max = BANDPOWER_Y_MAX;
+  }
+  bandPowerChart.update('none');
+}
+
+// Server-side features (app.py emit_features). Only the EMG RMS is used here;
+// EEG band power is still computed in the browser (updateFeatureCharts).
+// In dual-stream mode the main view is EEG, so the secondary EMG features are ignored.
+socket.on('features', payload => {
+  if (!bandPowerChart || currentSignalType !== 'emg' || payload.signal_type !== 'emg') return;
+  const rms = payload.features && payload.features.rms;
+  if (!Array.isArray(rms)) return;
+  bandPowerChart.data.labels = rms.map((_, i) => fileChannelNames[i] || `EMG ${i + 1}`);
+  bandPowerChart.data.datasets[0].data = rms;
+  bandPowerChart.update('none');
+});
+
 function updateFeatureCharts(channels, samplingRate, meanPower) {
   if (featureTimeChart) {
     featureHistory.push(meanPower || 0);
@@ -2666,7 +2800,7 @@ function updateFeatureCharts(channels, samplingRate, meanPower) {
     featureTimeChart.update('none');
   }
 
-  if (bandPowerChart && channels && channels.length) {
+  if (bandPowerChart && currentSignalType === 'eeg' && channels && channels.length) {
     const bandPowers = computeBandPowers(channels, samplingRate);
     bandPowerChart.data.datasets[0].data = bandPowers;
     bandPowerChart.options.scales.y.max = BANDPOWER_Y_MAX;
