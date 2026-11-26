@@ -129,6 +129,26 @@ Each movement becomes one marker: the label is the movement name, the descriptio
 
 Names come from the acquisition protocol's movement table (`MOVEMENT_NAMES` in `app.py`). Use `STIM_LSL_NAME` for another stream name. To try it without the second computer: `python scripts/fake_stimulus.py --blocks 2 --rest 0 --delay 10`.
 
+### CHUV setup (eegoSports over LSL)
+
+One LSL stream `eegoSports` carries everything: 1-128 EEG, 129-176 bipolar EMG/AUX inputs, 177 TRIGGER (1024 Hz).
+
+1. **Mode Selection → Hardware source → LSL stream**. The three fields **EEG / EMG / Trigger channel** default to `auto`: the first 2 s of data are analysed and the result is shown under the fields (e.g. *Detected: EEG 1-128 · EMG 135-139,141-143 · Trigger 177*). Trigger = the integer column that is almost always 0; EEG = the first 128 columns (or the LSL channel types when the stream names every channel); EMG = the remaining inputs that carry a signal (unplugged inputs are flat). Check it; type a list (1-based, e.g. `135-139,141-143`) in a field to override, or leave EMG / Trigger empty to switch them off.
+2. EEG + **Synchronized EEG + EMG** shows EEG in the main chart and EMG in the second panel; **EMG** alone shows only the EMG columns.
+3. **Start Recording**: markers are created live from the TRIGGER column (rest eyes open/closed, each move until the next trigger) — no `stimulus_stream` or shared network needed. Do not run **Listen to stimulus** at the same time, or markers are doubled.
+4. The same three fields split a replayed `.xdf` (simulation mode).
+
+Every selected channel is recorded; *Enabled Channels* only limits the display. The TRIGGER column itself is not exported: the `.xdf` stays the reference.
+
+### Stimulus on a serial port
+
+For a stimulus device plugged in by USB (for example an Arduino that sends the triggers), choose **Source → Serial port** in the Stimulus panel, pick the port (**Refresh** lists them; *Auto* works only when a single port is present), set the baud rate (default 115200, or `STIM_SERIAL_BAUD`), then **Listen to stimulus**.
+
+- The device must send **one integer per line in ASCII**, e.g. `51112\n`. Other text on the line is ignored.
+- Codes ≥ 10000 follow the `eeg_emg_v3.py` scheme above (movement markers with durations). Smaller codes become instantaneous markers named `trigger_<code>`.
+- The time is taken when the line arrives (USB delay of a few ms), not by the device.
+- Only one program can open a port: if LabRecorder or another script already reads the device, the interface cannot.
+
 ## Troubleshooting
 
 | Symptom | Fix |

@@ -246,6 +246,30 @@
                         <span id="modeLabel" class="mode-label">Hardware Mode</span>
                         <span class="mode-description">Toggle to enable simulation mode for testing without hardware</span>
                     </div>
+                    <div id="hardwareSourceSection" class="controls" style="margin-top:12px; flex-wrap:wrap; gap:8px;">
+                        <!-- Hidden in simulation mode: replay and synthetic data use no hardware -->
+                        <label id="hardwareSourceField">Hardware source
+                            <select id="hardwareSource" onchange="saveHardwareSource()">
+                                <option value="pieeg">PiEEG (BrainFlow)</option>
+                                <option value="dsi_lsl">LSL stream (DSI, eegoSports...)</option>
+                            </select>
+                        </label>
+                        <span id="lslChannelFields" style="display:none;">
+                            <!-- Columns of the amplifier stream (live LSL) or of the replayed file (1-based) -->
+                            <!-- "auto" = detected from the first seconds of data; a list (1-based) overrides it -->
+                            <label title="'auto' or 1-based columns, e.g. 1-128">EEG channels
+                                <input type="text" id="lslEegChannels" placeholder="auto" style="width:110px;" onchange="saveHardwareSource()">
+                            </label>
+                            <label title="'auto' (plugged inputs after the EEG) or 1-based columns, e.g. 135-139,141-143. Empty = no EMG">EMG channels
+                                <input type="text" id="lslEmgChannels" placeholder="auto" style="width:140px;" onchange="saveHardwareSource()">
+                            </label>
+                            <label title="'auto' or the column with the Arduino triggers (CHUV: 177). Live markers while recording. Empty = off">Trigger channel
+                                <input type="text" id="lslTriggerChannel" placeholder="auto" style="width:60px;" onchange="saveHardwareSource()">
+                            </label>
+                        </span>
+                        <div id="hardwareSourceStatus" class="file-status"></div>
+                        <div id="channelLayoutStatus" class="file-status" title="Check it; type a list in a field to override"></div>
+                    </div>
                     <div id="fileUploadSection" style="display: none; margin-top: 20px;">
                         <h3>Upload Session Folder (Recommended)</h3>
                         <p class="file-description">Select a BIDS-like folder containing signal (`.fif/.edf/.xdf/.json`) and companion files (`events.tsv`, `events.json`, `channels.tsv`).</p>
@@ -293,9 +317,9 @@
                     <div class="channel-settings">
                         <!-- Number of active channels to acquire and display.
                              PiEEG board: max 8.  DSI-24 headset: up to 24.
-                             Standard 64-ch cap: up to 64. -->
+                             High-density cap: up to 128. -->
                         <label>Enabled Channels
-                            <input type="number" id="enabled_channels" min="1" max="64" value="8" oninput="updateSettings()">
+                            <input type="number" id="enabled_channels" min="1" max="128" value="8" oninput="updateSettings()">
                         </label>
                         <label><input type="checkbox" id="ref_enabled" checked onchange="updateSettings()"> REF Enabled</label>
                         <label><input type="checkbox" id="biasout_enabled" checked onchange="updateSettings()"> BIASOUT Enabled</label>
@@ -318,7 +342,7 @@
                     <label for="waveformModeSelect">Display</label>
                     <select id="waveformModeSelect" onchange="setChartMode(this.value)">
                         <option value="overlap">Overlap</option>
-                        <option value="stacked" selected>EEG stacked</option>
+                        <option value="stacked" selected>Stacked</option>
                     </select>
                 </div>
                 <div class="waveform-mode" id="vertScaleControl">
@@ -456,7 +480,24 @@
                     <button onclick="endMarker()">End Marker</button>
                 </div>
                 <div style="margin-top:12px; padding-top:10px; border-top:1px solid rgba(255,255,255,0.1);">
-                    <h3 style="margin:0 0 8px;">Stimulus PC (LSL)</h3>
+                    <h3 style="margin:0 0 8px;">Stimulus</h3>
+                    <div class="controls">
+                        <label>Source
+                            <select id="stimSource" onchange="onStimSourceChange()">
+                                <option value="lsl">LSL (stimulus PC)</option>
+                                <option value="serial">Serial port</option>
+                            </select>
+                        </label>
+                    </div>
+                    <div id="stimSerialOptions" class="controls" style="display:none;">
+                        <label>Port
+                            <select id="stimPort"><option value="">Auto (only port)</option></select>
+                        </label>
+                        <button type="button" onclick="refreshStimPorts()">Refresh</button>
+                        <label>Baud
+                            <input type="number" id="stimBaud" value="115200" min="300" step="1" style="width:90px;">
+                        </label>
+                    </div>
                     <div class="controls">
                         <button id="startStimBtn" onclick="startStimListener()">Listen to stimulus</button>
                         <button id="stopStimBtn" onclick="stopStimListener()" disabled>Stop listening</button>
